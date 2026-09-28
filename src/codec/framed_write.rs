@@ -1,9 +1,10 @@
 use crate::codec::UserError;
 use crate::codec::UserError::*;
-use crate::frame::{self, Frame, FrameSize};
+use crate::frame::{self, Frame, FrameSize, StreamId};
 use crate::{hpack, tracing};
 
 use bytes::{Buf, BufMut, BytesMut};
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -14,7 +15,7 @@ use std::io::{self, Cursor};
 // A macro to get around a method needing to borrow &mut self
 macro_rules! limited_write_buf {
     ($self:expr) => {{
-        let limit = $self.max_frame_size() + frame::HEADER_LEN;
+        let limit = $self.max_header_frame_size() + frame::HEADER_LEN;
         $self.buf.get_mut().limit(limit)
     }};
 }
@@ -52,6 +53,35 @@ struct Encoder<B> {
 
     /// Min buffer required to attempt to write a frame
     min_buffer_capacity: usize,
+
+    /// Largest frame a header block goes into, if smaller than the peer's
+    /// max frame size.
+    header_frame_limit: Option<usize>,
+
+    /// Write each frame (with the frames that belong to it) with a write
+    /// call of its own.
+    separate_writes: bool,
+
+    /// Writing frames separately: the first DATA frame of a stream goes out
+    /// with the HEADERS frame buffered right before it.
+    data_joins_headers: bool,
+
+    /// Offsets in `buf` at which a write call ends, when writing frames
+    /// separately.
+    write_ends: VecDeque<usize>,
+
+    /// What was buffered last, to tell which frames go out together.
+    last: Last,
+}
+
+/// What the encoder buffered last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Last {
+    Nothing,
+    Preface,
+    InitialSettings,
+    Headers(StreamId),
+    Other,
 }
 
 #[derive(Debug)]
@@ -99,8 +129,21 @@ where
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
+                header_frame_limit: None,
+                separate_writes: false,
+                data_joins_headers: false,
+                write_ends: VecDeque::new(),
+                last: Last::Nothing,
             },
         }
+    }
+
+    /// Buffer the client connection preface, so that it goes out together
+    /// with the SETTINGS frame buffered next.
+    pub fn buffer_preface(&mut self) {
+        assert!(self.encoder.buf.get_ref().is_empty());
+        self.encoder.buf.get_mut().put_slice(frame::PREFACE);
+        self.encoder.last = Last::Preface;
     }
 
     /// Returns `Ready` when `send` is able to accept a frame
@@ -134,6 +177,29 @@ where
 
         loop {
             while !self.encoder.is_empty() {
+                // Writing frames separately: no write call goes past the next
+                // offset in `write_ends`.
+                let pos = self.encoder.buf.position() as usize;
+                while self
+                    .encoder
+                    .write_ends
+                    .front()
+                    .map_or(false, |end| *end <= pos)
+                {
+                    self.encoder.write_ends.pop_front();
+                }
+                if let Some(&end) = self.encoder.write_ends.front() {
+                    let mut part = (&mut self.encoder.buf).take(end - pos);
+                    let n = ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut part))?;
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write frame to socket",
+                        )));
+                    }
+                    continue;
+                }
+
                 let n = match self.encoder.next {
                     Some(Next::Data(ref mut frame)) => {
                         tracing::trace!(queued_data_frame = true);
@@ -194,6 +260,7 @@ where
         // Clear internal buffer
         self.buf.set_position(0);
         self.buf.get_mut().clear();
+        self.write_ends.clear();
 
         // The data frame has been written, so unset it
         match self.next.take() {
@@ -220,6 +287,10 @@ where
         let _span = tracing::trace_span!("FramedWrite::buffer", frame = ?item);
 
         tracing::debug!(frame = ?item, "send");
+
+        if self.separate_writes {
+            self.mark_write_end(&item);
+        }
 
         match item {
             Frame::Data(mut v) => {
@@ -296,6 +367,33 @@ where
         Ok(())
     }
 
+    /// Writing frames separately: end the pending write before `item`
+    /// unless it belongs with the frame buffered last. The preface, the
+    /// initial SETTINGS and a connection WINDOW_UPDATE right after them go
+    /// out together, and so do a HEADERS frame and a WINDOW_UPDATE for its
+    /// stream right after it, or its first DATA frame with
+    /// `data_joins_headers`.
+    fn mark_write_end(&mut self, item: &Frame<B>) {
+        let joins = match (self.last, item) {
+            (Last::Preface, Frame::Settings(settings)) => !settings.is_ack(),
+            (Last::InitialSettings, Frame::WindowUpdate(update)) => update.stream_id().is_zero(),
+            (Last::Headers(id), Frame::WindowUpdate(update)) => update.stream_id() == id,
+            (Last::Headers(id), Frame::Data(data)) => {
+                self.data_joins_headers && data.stream_id() == id
+            }
+            _ => false,
+        };
+        let len = self.buf.get_ref().len();
+        if !joins && len > self.buf.position() as usize {
+            self.write_ends.push_back(len);
+        }
+        self.last = match item {
+            Frame::Settings(_) if self.last == Last::Preface => Last::InitialSettings,
+            Frame::Headers(headers) => Last::Headers(headers.stream_id()),
+            _ => Last::Other,
+        };
+    }
+
     fn has_capacity(&self) -> bool {
         self.next.is_none()
             && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
@@ -314,6 +412,13 @@ impl<B> Encoder<B> {
     fn max_frame_size(&self) -> usize {
         self.max_frame_size as usize
     }
+
+    fn max_header_frame_size(&self) -> usize {
+        self.header_frame_limit
+            .map_or(self.max_frame_size(), |limit| {
+                limit.min(self.max_frame_size())
+            })
+    }
 }
 
 impl<T, B> FramedWrite<T, B> {
@@ -331,6 +436,29 @@ impl<T, B> FramedWrite<T, B> {
     /// Set the peer's header table size.
     pub fn set_header_table_size(&mut self, val: usize) {
         self.encoder.hpack.update_max_size(val);
+    }
+
+    /// Split header blocks into frames of at most `val` bytes, when the
+    /// peer allows larger ones.
+    pub fn set_max_header_frame_size(&mut self, val: usize) {
+        self.encoder.header_frame_limit = Some(val);
+    }
+
+    /// Write each frame with a write call of its own (see
+    /// `client::Builder::write_frames_individually`).
+    pub fn set_write_frames_individually(&mut self, enabled: bool) {
+        self.encoder.separate_writes = enabled;
+    }
+
+    /// Writing frames separately, write the first DATA frame of a stream
+    /// with its HEADERS (see `client::Builder::write_data_with_headers`).
+    pub fn set_data_joins_headers(&mut self, enabled: bool) {
+        self.encoder.data_joins_headers = enabled;
+    }
+
+    /// Compress header blocks like the given client.
+    pub fn set_header_compression(&mut self, compression: hpack::HeaderCompression) {
+        self.encoder.hpack.set_compression(compression);
     }
 
     /// Retrieve the last data frame that has been sent

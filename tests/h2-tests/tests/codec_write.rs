@@ -1,3 +1,4 @@
+use futures::StreamExt;
 use h2_support::prelude::*;
 
 #[tokio::test]
@@ -136,4 +137,268 @@ async fn server_settings_header_table_size() {
     stream.send_response(rsp, true).unwrap();
 
     assert!(srv.accept().await.is_none());
+}
+
+/// An I/O that keeps the bytes of every write call.
+struct RecordWrites<T> {
+    inner: T,
+    writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for RecordWrites<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for RecordWrites<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = polled {
+            self.writes.lock().unwrap().push(buf[..n].to_vec());
+        }
+        polled
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+fn record_writes<T>(
+    inner: T,
+) -> (
+    RecordWrites<T>,
+    std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+) {
+    let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let io = RecordWrites {
+        inner,
+        writes: writes.clone(),
+    };
+    (io, writes)
+}
+
+/// (type, stream ID, payload length) of the frames in `bytes`, after a
+/// connection preface at the start.
+fn frame_heads(bytes: &[u8]) -> Vec<(u8, u32, usize)> {
+    let mut rest = bytes.strip_prefix(&MAGIC_PREFACE[..]).unwrap_or(bytes);
+    let mut out = Vec::new();
+    while rest.len() >= 9 {
+        let len = u32::from_be_bytes([0, rest[0], rest[1], rest[2]]) as usize;
+        let stream = u32::from_be_bytes([rest[5], rest[6], rest[7], rest[8]]) & 0x7fff_ffff;
+        out.push((rest[3], stream, len));
+        rest = &rest[(9 + len).min(rest.len())..];
+    }
+    out
+}
+
+const DATA: u8 = 0;
+const HEADERS: u8 = 1;
+const SETTINGS: u8 = 4;
+const WINDOW_UPDATE: u8 = 8;
+const CONTINUATION: u8 = 9;
+
+#[tokio::test]
+async fn preface_alone_and_data_with_headers() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let (io, writes) = record_writes(io);
+
+    let srv = async move {
+        srv.read_preface().await.unwrap();
+        let settings = srv.next().await.unwrap().unwrap();
+        assert!(matches!(settings, frame::Frame::Settings(_)));
+        srv.recv_frame(frames::window_update(0, (1 << 20) - 65_535))
+            .await;
+        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+            .await;
+        srv.recv_frame(frames::data(1, &b"hello"[..]).eos()).await;
+        srv.send_frame(frames::settings()).await;
+        srv.recv_frame(frames::settings_ack()).await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .write_frames_individually(true)
+            .write_preface_alone(true)
+            .write_data_with_headers(true)
+            .initial_connection_window_size(1 << 20)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        // The preface went out in the handshake, on its own.
+        assert_eq!(*writes.lock().unwrap(), vec![MAGIC_PREFACE.to_vec()]);
+
+        let post = Request::post("https://example.com/").body(()).unwrap();
+        let (response, mut stream) = client.send_request(post, false).unwrap();
+        stream
+            .send_data(Bytes::from_static(b"hello"), true)
+            .unwrap();
+        conn.drive(response).await.unwrap();
+
+        let writes: Vec<Vec<(u8, u32)>> = writes.lock().unwrap()[1..]
+            .iter()
+            .map(|w| frame_heads(w).iter().map(|(t, s, _)| (*t, *s)).collect())
+            .collect();
+        assert_eq!(
+            writes[..3],
+            [
+                vec![(SETTINGS, 0)],
+                vec![(WINDOW_UPDATE, 0)],
+                vec![(HEADERS, 1), (DATA, 1)],
+            ]
+        );
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn frames_written_individually() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let (io, writes) = record_writes(io);
+
+    let srv = async move {
+        srv.read_preface().await.unwrap();
+        let settings = srv.next().await.unwrap().unwrap();
+        assert!(matches!(settings, frame::Frame::Settings(_)));
+        srv.recv_frame(frames::window_update(0, (1 << 20) - 65_535))
+            .await;
+        for id in [1, 3] {
+            srv.recv_frame(
+                frames::headers(id)
+                    .request("GET", "https://example.com/")
+                    .eos(),
+            )
+            .await;
+            srv.recv_frame(frames::window_update(id, (1 << 20) - 65_535))
+                .await;
+        }
+        srv.send_frame(frames::settings()).await;
+        srv.recv_frame(frames::settings_ack()).await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        srv.send_frame(frames::headers(3).response(200).eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .write_frames_individually(true)
+            .initial_connection_window_size(1 << 20)
+            .initial_stream_window_size(1 << 20)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        // Nothing is written before the connection is polled.
+        assert!(writes.lock().unwrap().is_empty());
+
+        let get = || Request::get("https://example.com/").body(()).unwrap();
+        let (first, _) = client.send_request(get(), true).unwrap();
+        let (second, _) = client.send_request(get(), true).unwrap();
+        conn.drive(first).await.unwrap();
+        conn.drive(second).await.unwrap();
+
+        let writes: Vec<Vec<(u8, u32, usize)>> = writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|w| frame_heads(w))
+            .collect();
+        assert_eq!(writes[0].len(), 2);
+        assert_eq!((writes[0][0].0, writes[0][1].0), (SETTINGS, WINDOW_UPDATE));
+        assert_eq!(
+            writes[1..4]
+                .iter()
+                .map(|w| w.iter().map(|(t, s, _)| (*t, *s)).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            [
+                vec![(HEADERS, 1), (WINDOW_UPDATE, 1)],
+                vec![(HEADERS, 3), (WINDOW_UPDATE, 3)],
+                vec![(SETTINGS, 0)],
+            ]
+        );
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn header_block_split_at_max_header_frame_size() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let (io, writes) = record_writes(io);
+    let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
+
+    let large = build_large_headers();
+    let expected = large.iter().fold(
+        frames::headers(1).request("GET", "https://example.com/"),
+        |frame, &(name, ref value)| frame.field(name, &value[..]),
+    );
+
+    let srv = async move {
+        let settings = frames::settings().max_frame_size(frame::MAX_MAX_FRAME_SIZE);
+        srv.assert_client_handshake_with_settings(settings).await;
+        ready_tx.send(()).unwrap();
+        srv.recv_frame(expected.eos()).await;
+        srv.send_frame(frames::headers(1).response(204).eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .max_header_frame_size(16_384)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        conn.drive(ready_rx).await.unwrap();
+
+        let mut request = Request::builder().uri("https://example.com/");
+        for &(name, ref value) in &large {
+            request = request.header(name, &value[..]);
+        }
+        let (response, _) = client
+            .send_request(request.body(()).unwrap(), true)
+            .unwrap();
+        conn.drive(response).await.unwrap();
+
+        let lengths: Vec<usize> = writes
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|w| frame_heads(w))
+            .filter(|(kind, id, _)| (*kind == HEADERS || *kind == CONTINUATION) && *id == 1)
+            .map(|(_, _, len)| len)
+            .collect();
+        assert!(lengths.len() > 2, "{:?}", lengths);
+        let (last, full) = lengths.split_last().unwrap();
+        assert!(full.iter().all(|len| *len == 16_384), "{:?}", lengths);
+        assert!(*last <= 16_384);
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
 }

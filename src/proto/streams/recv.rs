@@ -72,7 +72,7 @@ pub(super) enum Event {
 
 #[derive(Debug)]
 pub(super) enum RecvHeaderBlockError<T> {
-    Oversize(T),
+    Oversize(Box<T>),
     State(Error),
 }
 
@@ -93,6 +93,9 @@ impl Recv {
         flow.inc_window(DEFAULT_INITIAL_WINDOW_SIZE)
             .expect("invalid initial remote window size");
         flow.assign_capacity(DEFAULT_INITIAL_WINDOW_SIZE).unwrap();
+        if let Some(policy) = config.connection_window_update {
+            flow.set_update_policy(policy);
+        }
 
         Recv {
             init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
@@ -226,9 +229,9 @@ impl Recv {
                     HeaderMap::new(),
                 );
                 res.set_end_stream();
-                Err(RecvHeaderBlockError::Oversize(Some(res)))
+                Err(RecvHeaderBlockError::Oversize(Box::new(Some(res))))
             } else {
-                Err(RecvHeaderBlockError::Oversize(None))
+                Err(RecvHeaderBlockError::Oversize(Box::new(None)))
             };
         }
 
@@ -440,6 +443,7 @@ impl Recv {
         // TODO: proper error handling
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
+        self.flow.note_release();
 
         if self.flow.unclaimed_capacity().is_some() {
             if let Some(task) = task.take() {
@@ -470,6 +474,7 @@ impl Recv {
         // TODO: proper error handling
         let _res = stream.recv_flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
+        stream.recv_flow.note_release();
 
         if stream.recv_flow.unclaimed_capacity().is_some() {
             // Queue the stream for sending the WINDOW_UPDATE frame.
@@ -539,6 +544,7 @@ impl Recv {
             .checked_size();
         if target > current {
             self.flow.assign_capacity(target - current)?;
+            self.flow.force_update();
         } else {
             self.flow.claim_capacity(current - target)?;
         }
@@ -1114,6 +1120,7 @@ impl Recv {
             self.flow
                 .inc_window(incr)
                 .expect("unexpected flow control state");
+            self.flow.window_update_sent();
         }
 
         Poll::Ready(Ok(()))
@@ -1169,6 +1176,7 @@ impl Recv {
                         .recv_flow
                         .inc_window(incr)
                         .expect("unexpected flow control state");
+                    stream.recv_flow.window_update_sent();
                 }
             })
         }

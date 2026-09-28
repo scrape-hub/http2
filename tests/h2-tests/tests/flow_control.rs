@@ -2237,3 +2237,167 @@ async fn too_many_window_update_resets_causes_go_away() {
 
     join(srv, client).await;
 }
+
+#[tokio::test]
+async fn initial_stream_window_update_follows_headers() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_eq!(settings.initial_window_size(), Some(16_384));
+        for id in [1, 3] {
+            srv.recv_frame(
+                frames::headers(id)
+                    .request("GET", "https://example.com/")
+                    .eos(),
+            )
+            .await;
+            // The increment starts from the advertised initial window.
+            srv.recv_frame(frames::window_update(id, 65_535 - 16_384))
+                .await;
+        }
+        // The stream takes more than the advertised window.
+        srv.send_frame(frames::headers(1).response(200)).await;
+        for _ in 0..2 {
+            srv.send_frame(frames::data(1, vec![0; 16_384])).await;
+        }
+        srv.send_frame(frames::data(1, vec![0; 16_384]).eos()).await;
+        srv.send_frame(frames::headers(3).response(200).eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .initial_window_size(16_384)
+            .initial_stream_window_size(65_535)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let get = || Request::get("https://example.com/").body(()).unwrap();
+        let (first, _) = client.send_request(get(), true).unwrap();
+        let (second, _) = client.send_request(get(), true).unwrap();
+        let body = async move {
+            let mut body = first.await.unwrap().into_body();
+            let mut len = 0;
+            while let Some(chunk) = body.data().await {
+                len += chunk.unwrap().len();
+            }
+            assert_eq!(len, 3 * 16_384);
+        };
+        conn.drive(body).await;
+        conn.drive(second).await.unwrap();
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn window_update_policy_threshold_and_low_window() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        for _ in 0..3 {
+            srv.send_frame(frames::data(1, vec![0; 12_000])).await;
+        }
+        // The connection reached its threshold of 30000 released bytes.
+        srv.recv_frame(frames::window_update(0, 36_000)).await;
+        srv.send_frame(frames::data(1, vec![0; 12_000])).await;
+        // 17_535 bytes of stream window left: at or below the low window,
+        // before the threshold of 50000.
+        srv.recv_frame(frames::window_update(1, 48_000)).await;
+        srv.ping_pong([1; 8]).await;
+        srv.send_frame(frames::data(1, vec![]).eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .stream_window_update(client::WindowUpdatePolicy::threshold(50_000).low_window(20_000))
+            .connection_window_update(client::WindowUpdatePolicy::threshold(30_000))
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let (response, _) = client
+            .send_request(Request::get("https://example.com/").body(()).unwrap(), true)
+            .unwrap();
+        let body = async move {
+            let mut body = response.await.unwrap().into_body();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.unwrap();
+                body.flow_control().release_capacity(chunk.len()).unwrap();
+            }
+        };
+        conn.drive(body).await;
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn window_update_policy_interval() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, vec![0; 100])).await;
+        srv.ping_pong([1; 8]).await;
+        srv.send_frame(frames::data(1, vec![0; 100])).await;
+        // Released after the interval: both chunks go back.
+        srv.recv_frame(frames::window_update(1, 200)).await;
+        srv.send_frame(frames::data(1, vec![]).eos()).await;
+    };
+
+    let client = async move {
+        let policy =
+            client::WindowUpdatePolicy::threshold(1 << 20).interval(Duration::from_millis(300));
+        let (mut client, mut conn) = client::Builder::new()
+            .stream_window_update(policy)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let (response, _) = client
+            .send_request(Request::get("https://example.com/").body(()).unwrap(), true)
+            .unwrap();
+        let body = async move {
+            let mut body = response.await.unwrap().into_body();
+            let chunk = body.data().await.unwrap().unwrap();
+            // Right away: no update yet.
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+            let chunk = body.data().await.unwrap().unwrap();
+            // Past the interval, deterministically: advances the paused clock the
+            // policy's Instant::now() reads, instead of a real sleep.
+            tokio::time::advance(Duration::from_millis(400)).await;
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+            while let Some(chunk) = body.data().await {
+                assert!(chunk.unwrap().is_empty());
+            }
+        };
+        conn.drive(body).await;
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}

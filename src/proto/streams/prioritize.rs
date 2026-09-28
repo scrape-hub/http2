@@ -58,6 +58,17 @@ pub(super) struct Prioritize {
 
     /// The maximum amount of bytes a stream should buffer.
     max_buffer_size: usize,
+
+    /// Frames that go out right after the HEADERS frame written last: the
+    /// stream's initial WINDOW_UPDATE, then a PING.
+    after_headers: AfterHeaders,
+}
+
+/// Frames queued to go out right after the last HEADERS frame written.
+#[derive(Debug, Default)]
+struct AfterHeaders {
+    window_update: Option<frame::WindowUpdate>,
+    ping: Option<frame::Ping>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -103,6 +114,7 @@ impl Prioritize {
             last_opened_id: StreamId::ZERO,
             in_flight_data_frame: InFlightData::Nothing,
             max_buffer_size: config.local_max_buffer_size,
+            after_headers: AfterHeaders::default(),
         }
     }
 
@@ -528,6 +540,17 @@ impl Prioritize {
         tracing::trace!("poll_complete");
 
         loop {
+            // Frames that belong right after the last HEADERS frame.
+            if let Some(frame) = self.after_headers.window_update.take() {
+                dst.buffer(frame.into())
+                    .expect("invalid WINDOW_UPDATE frame");
+                ready!(dst.poll_ready(cx))?;
+            }
+            if let Some(frame) = self.after_headers.ping.take() {
+                dst.buffer(frame.into()).expect("invalid PING frame");
+                ready!(dst.poll_ready(cx))?;
+            }
+
             if let Some(mut stream) = self.pop_pending_open(store, counts) {
                 self.pending_send.push_front(&mut stream);
                 self.try_assign_capacity(&mut stream);
@@ -861,6 +884,16 @@ impl Prioritize {
                     };
 
                     tracing::trace!("pop_frame; frame={:?}", frame);
+
+                    if let Frame::Headers(_) = frame {
+                        // Only set for the HEADERS that open the stream.
+                        let window_update = stream.initial_window_update.take();
+                        self.after_headers = AfterHeaders {
+                            window_update: window_update
+                                .map(|incr| frame::WindowUpdate::new(stream.id, incr)),
+                            ping: stream.ping_after_headers.take(),
+                        };
+                    }
 
                     if cfg!(debug_assertions) && stream.state.is_idle() {
                         debug_assert!(stream.id > self.last_opened_id);

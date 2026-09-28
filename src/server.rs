@@ -1517,6 +1517,11 @@ where
                             headers_stream_dependency: None,
                             headers_pseudo_order: None,
                             priorities: None,
+                            stream_dependency_chain: false,
+                            initial_stream_window_update: None,
+                            stream_window_update: None,
+                            connection_window_update: None,
+                            go_away_on_close: true,
                         },
                     );
 

@@ -54,6 +54,9 @@ where
     /// Stream state handler
     streams: Streams<B, P>,
 
+    /// Whether a graceful close sends GOAWAY before closing the transport.
+    go_away_on_close: bool,
+
     /// A `tracing` span tracking the lifetime of the connection.
     #[cfg(feature = "tracing")]
     span: ::tracing::Span,
@@ -87,6 +90,11 @@ pub(crate) struct Config {
     pub headers_pseudo_order: Option<PseudoOrder>,
     pub headers_stream_dependency: Option<StreamDependency>,
     pub priorities: Option<Priorities>,
+    pub stream_dependency_chain: bool,
+    pub initial_stream_window_update: Option<WindowSize>,
+    pub stream_window_update: Option<WindowUpdatePolicy>,
+    pub connection_window_update: Option<WindowUpdatePolicy>,
+    pub go_away_on_close: bool,
 }
 
 #[derive(Debug)]
@@ -130,6 +138,10 @@ where
                 headers_stream_dependency: config.headers_stream_dependency,
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
                 priorities: config.priorities.clone(),
+                stream_dependency_chain: config.stream_dependency_chain,
+                initial_stream_window_update: config.initial_stream_window_update,
+                stream_window_update: config.stream_window_update,
+                connection_window_update: config.connection_window_update,
             }
         }
         let streams = Streams::new(streams_config(&config));
@@ -146,6 +158,7 @@ where
                 ping_pong: PingPong::new(),
                 settings: Settings::new(config.settings),
                 streams,
+                go_away_on_close: config.go_away_on_close,
                 #[cfg(feature = "tracing")]
                 span,
                 _phantom: PhantomData,
@@ -250,7 +263,16 @@ where
         // If we poll() and realize that there are no streams or references
         // then we can close the connection by transitioning to GOAWAY
         if !self.inner.streams.has_streams_or_other_references() {
+            self.close_gracefully();
+        }
+    }
+
+    /// Close without error: with a GOAWAY first, or just the transport.
+    fn close_gracefully(&mut self) {
+        if self.inner.go_away_on_close {
             self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
+        } else if let State::Open = self.inner.state {
+            self.inner.state = State::Closing(Reason::NO_ERROR, Initiator::Library);
         }
     }
 
@@ -299,7 +321,7 @@ where
                                 || self.inner.go_away.should_close_on_idle())
                                 && !self.inner.streams.has_streams()
                             {
-                                self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
+                                self.close_gracefully();
                                 continue;
                             }
 

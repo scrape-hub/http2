@@ -1,3 +1,4 @@
+use super::browser::{BrowserEncoder, HeaderCompression};
 use super::table::{Index, Table};
 use super::{huffman, Header};
 use crate::tracing;
@@ -9,6 +10,8 @@ use http::header::{HeaderName, HeaderValue};
 pub struct Encoder {
     table: Table,
     size_update: Option<SizeUpdate>,
+    /// Replaces this encoder with a browser's rules.
+    browser: Option<BrowserEncoder>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -22,13 +25,23 @@ impl Encoder {
         Encoder {
             table: Table::new(max_size, capacity),
             size_update: None,
+            browser: None,
         }
+    }
+
+    /// Compress header blocks like the given client from now on.
+    pub fn set_compression(&mut self, compression: HeaderCompression) {
+        self.browser = BrowserEncoder::new(compression, self.table.max_size());
     }
 
     /// Queues a max size update.
     ///
     /// The next call to `encode` will include a dynamic size update frame.
     pub fn update_max_size(&mut self, val: usize) {
+        if let Some(browser) = &mut self.browser {
+            browser.update_max_size(val);
+            return;
+        }
         match self.size_update {
             Some(SizeUpdate::One(old)) => {
                 if val > old {
@@ -64,6 +77,11 @@ impl Encoder {
         I: IntoIterator<Item = Header<Option<HeaderName>>>,
     {
         let _span = tracing::trace_span!("hpack::encode");
+
+        if let Some(browser) = &mut self.browser {
+            browser.encode(headers, dst);
+            return;
+        }
 
         self.encode_size_updates(dst);
 
@@ -261,7 +279,7 @@ fn encode_str(val: &[u8], dst: &mut BytesMut) {
 }
 
 /// Encode an integer into the given destination buffer
-fn encode_int<B: BufMut>(
+pub(super) fn encode_int<B: BufMut>(
     mut value: usize,   // The integer to encode
     prefix_bits: usize, // The number of bits in the prefix
     first_byte: u8,     // The base upon which to start encoding the int

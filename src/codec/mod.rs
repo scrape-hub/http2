@@ -95,6 +95,26 @@ impl<T, B> Codec<T, B> {
         self.framed_write().set_header_table_size(val)
     }
 
+    /// Split header blocks into frames of at most `val` bytes.
+    pub fn set_max_header_frame_size(&mut self, val: usize) {
+        self.framed_write().set_max_header_frame_size(val)
+    }
+
+    /// Write each frame with a write call of its own.
+    pub fn set_write_frames_individually(&mut self, enabled: bool) {
+        self.framed_write().set_write_frames_individually(enabled)
+    }
+
+    /// Write the first DATA frame of a stream with its HEADERS.
+    pub fn set_data_joins_headers(&mut self, enabled: bool) {
+        self.framed_write().set_data_joins_headers(enabled)
+    }
+
+    /// Compress header blocks like the given client.
+    pub fn set_header_compression(&mut self, compression: crate::hpack::HeaderCompression) {
+        self.framed_write().set_header_compression(compression)
+    }
+
     /// Set the decoder header table size size.
     pub fn set_recv_header_table_size(&mut self, val: usize) {
         self.inner.set_header_table_size(val)
@@ -131,6 +151,11 @@ where
     T: AsyncWrite + Unpin,
     B: Buf,
 {
+    /// Buffer the client connection preface ahead of the first frame.
+    pub fn buffer_preface(&mut self) {
+        self.framed_write().buffer_preface()
+    }
+
     /// Returns `Ready` when the codec can buffer a frame
     pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.framed_write().poll_ready(cx)

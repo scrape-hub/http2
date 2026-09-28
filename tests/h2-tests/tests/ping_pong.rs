@@ -183,3 +183,84 @@ async fn user_notifies_when_connection_closes() {
         "broken pipe",
     );
 }
+
+#[tokio::test]
+async fn user_ping_with_payload() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let second = [0, 0, 0, 0, 0, 0, 0, 2];
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        ready_tx.send(()).unwrap();
+        srv.recv_frame(frames::ping([0; 8])).await;
+        srv.send_frame(frames::ping([0; 8]).pong()).await;
+        srv.recv_frame(frames::ping(second)).await;
+        srv.send_frame(frames::ping(second).pong()).await;
+    };
+
+    let client = async move {
+        let (client, mut conn) = client::handshake(io).await.expect("handshake");
+        let mut ping_pong = client::Connection::ping_pong(&mut conn).expect("taking ping_pong");
+        conn.drive(ready_rx).await.unwrap();
+        let pings = async move {
+            ping_pong.ping(Ping::with_payload([0; 8])).await.unwrap();
+            ping_pong.ping(Ping::with_payload(second)).await.unwrap();
+        };
+        conn.drive(pings).await;
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn ping_from_request_follows_its_headers() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let payload = [0, 0, 0, 0, 0, 0, 0, 1];
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.recv_frame(frames::ping(payload)).await;
+        srv.send_frame(frames::ping(payload).pong()).await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        // Only the request that carried it sends a PING.
+        srv.recv_frame(
+            frames::headers(3)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(3).response(200).eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::handshake(io).await.expect("handshake");
+        let request = Request::builder()
+            .uri("https://example.com/")
+            .extension(frame::Ping::new(payload))
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        conn.drive(response).await.unwrap();
+        let (response, _) = client
+            .send_request(Request::get("https://example.com/").body(()).unwrap(), true)
+            .unwrap();
+        conn.drive(response).await.unwrap();
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}

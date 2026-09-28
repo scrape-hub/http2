@@ -125,6 +125,7 @@ pub struct PseudoOrderBuilder {
 // ===== impl PseudoOrder =====
 
 impl PseudoOrder {
+    /// Starts building a `PseudoOrder`.
     pub fn builder() -> PseudoOrderBuilder {
         PseudoOrderBuilder {
             ids: SmallVec::new(),
@@ -153,6 +154,8 @@ impl<'a> IntoIterator for &'a PseudoOrder {
 // ===== impl PseudoOrderBuilder =====
 
 impl PseudoOrderBuilder {
+    /// Appends a pseudo-header to the order. A pseudo-header already added is
+    /// ignored.
     pub fn push(mut self, id: PseudoId) -> Self {
         let mask_id = id.mask_id();
         if mask_id != 0 {
@@ -166,6 +169,8 @@ impl PseudoOrderBuilder {
         self
     }
 
+    /// Appends every pseudo-header of `iter` to the order, each subject to
+    /// the same duplicate check as [`Self::push`].
     pub fn extend(mut self, iter: impl IntoIterator<Item = PseudoId>) -> Self {
         for id in iter {
             self = self.push(id);
@@ -173,6 +178,9 @@ impl PseudoOrderBuilder {
         self
     }
 
+    /// Finishes the builder into a `PseudoOrder`. Any pseudo-header not
+    /// explicitly pushed is appended in its default order, so every
+    /// `PseudoOrder` this returns lists all of them.
     pub fn build(mut self) -> PseudoOrder {
         if self.ids.len() != PseudoId::DEFAULT_IDS.len() {
             self = self.extend(PseudoId::DEFAULT_IDS);
@@ -1077,6 +1085,7 @@ impl HeaderBlock {
 
     fn into_encoding(self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
         let mut hpack = BytesMut::new();
+
         let headers = Iter {
             pseudo: Some(self.pseudo),
             fields: self.fields.into_iter(),

@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn test_experimental_settings_builder() {
         // ignore id > SettingId::MAX_ID
-        assert!(SettingId::MAX_ID < 16);
+        const _: () = assert!(SettingId::MAX_ID < 16);
 
         let unknown = ExperimentalSettings::builder()
             .extend(vec![

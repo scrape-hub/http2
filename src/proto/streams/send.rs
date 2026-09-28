@@ -322,6 +322,28 @@ impl Send {
         self.prioritize.schedule_send(stream, task);
     }
 
+    /// Closes the send half of a half-closed (remote) stream without a frame:
+    /// what is still queued for it is dropped. Returns whether the stream is
+    /// now closed; it stays as it is in any other state.
+    pub fn abandon<B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) -> bool {
+        if stream.state.is_closed() {
+            return true;
+        }
+        if !stream.state.is_recv_end_stream() || stream.is_pending_open {
+            return false;
+        }
+        tracing::trace!("abandon; stream={:?}", stream.id);
+        self.prioritize.clear_queue(buffer, stream);
+        stream.state.send_close();
+        self.prioritize.reclaim_all_capacity(stream, counts);
+        true
+    }
+
     pub fn send_data<B>(
         &mut self,
         frame: frame::Data<B>,

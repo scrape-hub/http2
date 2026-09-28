@@ -13,7 +13,7 @@ use super::{
     recv::RecvHeaderBlockError,
     store::{self, Entry, Resolve, Store},
     sync::Mutex,
-    Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId,
+    Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId, WindowUpdatePolicy,
 };
 use crate::{
     client,
@@ -97,6 +97,25 @@ struct Inner {
 
     /// Priority of the headers stream
     priorities: Option<Priorities>,
+
+    /// Whether `priorities` went out with the first stream already.
+    priorities_sent: bool,
+
+    /// Chain each new stream's dependency to the open streams (see
+    /// `client::Builder::stream_dependency_chain`).
+    stream_dependency_chain: bool,
+
+    /// WINDOW_UPDATE sent with the HEADERS of each new local stream.
+    initial_stream_window_update: Option<WindowSize>,
+
+    /// When the receive window of a local stream is topped up.
+    stream_window_update: Option<WindowUpdatePolicy>,
+
+    /// Whether the peer's initial SETTINGS frame has been applied.
+    remote_settings_received: bool,
+
+    /// Tasks waiting for the peer's initial SETTINGS frame.
+    remote_settings_waiters: Vec<Waker>,
 }
 
 #[derive(Debug)]
@@ -219,13 +238,18 @@ where
 
         me.counts.apply_remote_settings(frame, is_initial);
 
-        me.actions.send.apply_remote_settings(
+        let applied = me.actions.send.apply_remote_settings(
             frame,
             send_buffer,
             &mut me.store,
             &mut me.counts,
             &mut me.actions.task,
-        )
+        );
+        if is_initial {
+            me.remote_settings_received = true;
+            me.wake_remote_settings_waiters();
+        }
+        applied
     }
 
     pub fn apply_local_settings(&mut self, frame: &frame::Settings) -> Result<(), Error> {
@@ -246,6 +270,8 @@ where
         use super::stream::ContentLength;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        let request_dependency = request.extensions_mut().remove::<StreamDependency>();
+        let ping_after_headers = request.extensions_mut().remove::<frame::Ping>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -293,8 +319,30 @@ where
             stream.content_length = ContentLength::Head;
         }
 
+        if let Some(policy) = me.stream_window_update {
+            stream.recv_flow.set_update_policy(policy);
+        }
+        if let Some(incr) = me.initial_stream_window_update {
+            // The peer learns about the larger window from the WINDOW_UPDATE
+            // written after the HEADERS; no data can arrive before them.
+            let incr = incr.min(proto::MAX_WINDOW_SIZE - stream.recv_flow.window_size());
+            let _res = stream.recv_flow.inc_window(incr);
+            debug_assert!(_res.is_ok());
+            let _res = stream.recv_flow.assign_capacity(incr);
+            debug_assert!(_res.is_ok());
+            stream.initial_window_update = Some(incr).filter(|incr| *incr > 0);
+        }
+        stream.ping_after_headers = ping_after_headers;
+
+        // The PRIORITY frames go out once, before the first stream's HEADERS.
+        let priorities = if me.priorities_sent {
+            None
+        } else {
+            me.priorities.clone()
+        };
+
         // Priorities frame check before sending the request.
-        if let Some(priorities) = &me.priorities {
+        if let Some(priorities) = &priorities {
             let next_id = priorities
                 .max_stream_id()
                 .next_id()
@@ -305,6 +353,15 @@ where
             }
         }
 
+        // A dependency set on the request replaces the connection-wide one.
+        let mut stream_dependency = request_dependency.or(me.headers_stream_dependency);
+        if me.stream_dependency_chain {
+            if let Some(dep) = stream_dependency {
+                stream_dependency = Some(chained_dependency(&mut me.store, dep));
+                stream.dependency_weight = Some(dep.weight());
+            }
+        }
+
         // Convert the message
         let headers = client::Peer::convert_send_message(
             stream_id,
@@ -312,13 +369,13 @@ where
             protocol,
             end_of_stream,
             me.headers_pseudo_order.clone(),
-            me.headers_stream_dependency,
+            stream_dependency,
         )?;
 
         let mut stream = me.store.insert(stream.id, stream);
 
         let sent = me.actions.send.send_priority_and_headers(
-            me.priorities.clone(),
+            priorities,
             headers,
             send_buffer,
             &mut stream,
@@ -333,6 +390,7 @@ where
             stream.remove();
             return Err(err.into());
         }
+        me.priorities_sent = true;
 
         // Given that the stream has been initialized, it should not be in the
         // closed state.
@@ -358,6 +416,24 @@ where
             .actions
             .send
             .is_extended_connect_protocol_enabled()
+    }
+
+    /// Ready once the peer's initial SETTINGS frame has been applied, or with
+    /// the connection's error if it failed first.
+    pub(crate) fn poll_remote_settings(&self, cx: &Context) -> Poll<Result<(), proto::Error>> {
+        let mut me = self.inner.lock();
+        if me.remote_settings_received {
+            return Poll::Ready(Ok(()));
+        }
+        me.actions.ensure_no_conn_error()?;
+        if !me
+            .remote_settings_waiters
+            .iter()
+            .any(|waker| waker.will_wake(cx.waker()))
+        {
+            me.remote_settings_waiters.push(cx.waker().clone());
+        }
+        Poll::Pending
     }
 
     pub fn current_max_send_streams(&self) -> usize {
@@ -457,7 +533,21 @@ impl Inner {
             headers_stream_dependency: config.headers_stream_dependency,
             headers_pseudo_order: config.headers_pseudo_order,
             priorities: config.priorities,
+            priorities_sent: false,
+            stream_dependency_chain: config.stream_dependency_chain,
+            initial_stream_window_update: config.initial_stream_window_update,
+            stream_window_update: config.stream_window_update,
+            remote_settings_received: false,
+            remote_settings_waiters: Vec::new(),
         }))
+    }
+
+    /// Wakes the tasks waiting for the peer's initial SETTINGS: they arrived,
+    /// or the connection failed.
+    fn wake_remote_settings_waiters(&mut self) {
+        for waker in self.remote_settings_waiters.drain(..) {
+            waker.wake();
+        }
     }
 
     fn recv_headers<B>(
@@ -543,7 +633,7 @@ impl Inner {
                 match actions.recv.recv_headers(frame, stream, counts) {
                     Ok(()) => Ok(()),
                     Err(RecvHeaderBlockError::Oversize(resp)) => {
-                        if let Some(resp) = resp {
+                        if let Some(resp) = *resp {
                             let sent = actions.send.send_headers(
                                 resp, send_buffer, stream, counts, &mut actions.task);
                             debug_assert!(sent.is_ok(), "oversize response should not fail");
@@ -749,6 +839,7 @@ impl Inner {
         });
 
         actions.conn_error = Some(err);
+        self.wake_remote_settings_waiters();
 
         last_processed_id
     }
@@ -779,6 +870,7 @@ impl Inner {
         });
 
         actions.conn_error = Some(err);
+        self.wake_remote_settings_waiters();
 
         Ok(())
     }
@@ -918,6 +1010,7 @@ impl Inner {
         });
 
         actions.clear_queues(clear_pending_accept, &mut self.store, counts);
+        self.wake_remote_settings_waiters();
         Ok(())
     }
 
@@ -1188,6 +1281,38 @@ impl<B> StreamRef<B> {
                 unreachable!("Initiator::User should not error sending reset");
             }
         }
+    }
+
+    /// Queues a RST_STREAM frame behind the frames still queued for the
+    /// stream (see `SendStream::send_reset_after_data`).
+    pub fn send_reset_after_data(&mut self, reason: Reason) {
+        let mut me = self.opaque.inner.lock();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+        let actions = &mut me.actions;
+        me.counts.transition(stream, |counts, stream| {
+            actions
+                .send
+                .schedule_implicit_reset(stream, reason, counts, &mut actions.task);
+            actions.recv.enqueue_reset_expiration(stream, counts);
+        })
+    }
+
+    /// Closes the send half of a stream the peer has ended without a frame
+    /// (see `SendStream::abandon`). Returns whether the stream is now closed.
+    pub fn abandon(&mut self) -> bool {
+        let mut me = self.opaque.inner.lock();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+        let actions = &mut me.actions;
+        let mut send_buffer = self.send_buffer.inner.lock();
+        let send_buffer = &mut *send_buffer;
+
+        me.counts.transition(stream, |counts, stream| {
+            actions.send.abandon(send_buffer, stream, counts)
+        })
     }
 
     pub fn send_informational_headers(&mut self, frame: frame::Headers) -> Result<(), UserError> {
@@ -1623,6 +1748,32 @@ fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Cou
             .schedule_implicit_reset(stream, reason, counts, &mut actions.task);
         actions.recv.enqueue_reset_expiration(stream, counts);
     }
+}
+
+/// The dependency of a new stream with `dep`'s weight when streams form a
+/// chain (Chromium's `Http2PriorityDependencies`): the most recently opened
+/// stream that is still open, among those of the lowest weight not below its
+/// own. Without such a stream, the new one depends on stream 0.
+fn chained_dependency(store: &mut Store, dep: StreamDependency) -> StreamDependency {
+    let weight = dep.weight();
+    let mut parent: Option<(u8, StreamId)> = None;
+    store.for_each(|stream| {
+        let Some(w) = stream.dependency_weight else {
+            return;
+        };
+        if w < weight || stream.state.is_closed() {
+            return;
+        }
+        let closer = match parent {
+            None => true,
+            Some((pw, pid)) => w < pw || (w == pw && stream.id > pid),
+        };
+        if closer {
+            parent = Some((w, stream.id));
+        }
+    });
+    let parent_id = parent.map_or(StreamId::ZERO, |(_, id)| id);
+    StreamDependency::new(parent_id, weight, dep.is_exclusive())
 }
 
 // ===== impl SendBuffer =====

@@ -192,6 +192,16 @@ impl Mock<frame::Headers> {
         self
     }
 
+    /// Sets the priority block; call `eos` afterwards.
+    pub fn stream_dependency(mut self, dependency: u32, weight: u8, exclusive: bool) -> Self {
+        self.0.set_stream_dependency(frame::StreamDependency::new(
+            dependency.into(),
+            weight,
+            exclusive,
+        ));
+        self
+    }
+
     pub fn into_fields(self) -> HeaderMap {
         self.0.into_parts().1
     }

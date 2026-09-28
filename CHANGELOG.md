@@ -1,3 +1,25 @@
+# Fork changes (unreleased)
+
+Changes of this fork on top of http2 0.5.12. They let a client send the HTTP/2
+frames of Chrome, Firefox, Safari and OkHttp.
+
+* Client `Builder` options: `header_compression` (the HPACK encoders of Chrome,
+  Firefox and Safari, see `HeaderCompression`), `stream_dependency_chain`
+  (Chromium's exclusive stream dependencies), `initial_stream_window_size`,
+  `stream_window_update` and `connection_window_update` (when WINDOW_UPDATE
+  frames go out, see `WindowUpdatePolicy`), `max_header_frame_size` (where a
+  header block is split into CONTINUATION frames) and `go_away_on_close`.
+* Write batching: `write_frames_individually`, `write_preface_alone` and
+  `write_data_with_headers` decide which frames share a write call, and so a
+  TLS record.
+* `SendRequest::poll_remote_settings` waits for the server's first SETTINGS
+  frame.
+* `SendStream::send_reset_after_data` resets a stream after its queued data;
+  `SendStream::abandon` stops sending on a stream the peer has ended, without
+  END_STREAM or RST_STREAM.
+* `Ping::with_payload` sends a PING with a chosen payload.
+* `PseudoOrder::builder` and `PseudoOrderBuilder` are documented.
+
 # 0.4.13 (January 5, 2026)
 
 * Add support for 1xx informational responses on client and server side.

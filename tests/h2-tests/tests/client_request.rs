@@ -1634,6 +1634,130 @@ async fn extended_connect_request() {
 }
 
 #[tokio::test]
+async fn poll_remote_settings_waits_for_the_server_settings() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(frames::settings().enable_connect_protocol(1))
+            .await;
+        assert_default_settings!(settings);
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        // Nothing has arrived yet: the default applies.
+        assert!(!client.is_extended_connect_protocol_enabled());
+
+        h2.drive(poll_fn(|cx| client.poll_remote_settings(cx)))
+            .await
+            .unwrap();
+        assert!(client.is_extended_connect_protocol_enabled());
+        // Once received, it stays ready.
+        poll_fn(|cx| client.poll_remote_settings(cx)).await.unwrap();
+        drop(client);
+        h2.await.unwrap();
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn poll_remote_settings_fails_when_the_connection_ends_first() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        srv.read_preface().await.unwrap();
+        // The client's SETTINGS, then the connection closes without the
+        // server's.
+        let _ = srv.next().await;
+        drop(srv);
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let err = h2
+            .drive(poll_fn(|cx| client.poll_remote_settings(cx)))
+            .await
+            .unwrap_err();
+        assert!(err.is_io(), "{err:?}");
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn abandon_closes_a_half_closed_stream_without_a_frame() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(frames::settings().enable_connect_protocol(1))
+            .await;
+        assert_default_settings!(settings);
+
+        srv.recv_frame(frames::headers(1).pseudo(frame::Pseudo {
+            method: Method::CONNECT.into(),
+            scheme: util::byte_str("https").into(),
+            authority: util::byte_str("example.com").into(),
+            path: util::byte_str("/chat").into(),
+            protocol: Protocol::from_static("websocket").into(),
+            ..Default::default()
+        }))
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, "bye").eos()).await;
+        // Neither END_STREAM nor RST_STREAM for stream 1: the next frame is
+        // the next request.
+        srv.recv_frame(
+            frames::headers(3)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(3).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        h2.drive(poll_fn(|cx| client.poll_remote_settings(cx)))
+            .await
+            .unwrap();
+
+        let request = Request::connect("https://example.com/chat")
+            .extension(Protocol::from("websocket"))
+            .body(())
+            .unwrap();
+        let (response, mut send) = client.send_request(request, false).unwrap();
+        // The server has not ended the stream: nothing to abandon.
+        assert!(!send.abandon());
+        let response = h2.drive(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let data = h2.drive(body.data()).await.unwrap().unwrap();
+        assert_eq!(data, "bye");
+        assert!(h2.drive(body.data()).await.is_none());
+
+        assert!(send.abandon());
+        // Sending on it fails now, and dropping it sends no RST_STREAM.
+        assert!(send.send_data("late".into(), false).is_err());
+        drop(send);
+        drop(body);
+        // A RST_STREAM would go out now, before the next request.
+        h2.drive(idle_ms(20)).await;
+
+        let request = Request::get("https://example.com/").body(()).unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        h2.drive(response).await.unwrap();
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
 async fn rogue_server_odd_headers() {
     h2_support::trace_init!();
     let (io, mut srv) = mock::new();
@@ -2061,6 +2185,44 @@ async fn reset_before_headers_reaches_peer_without_headers() {
 
 const SETTINGS: &[u8] = &[0, 0, 0, 4, 0, 0, 0, 0, 0];
 const SETTINGS_ACK: &[u8] = &[0, 0, 0, 4, 1, 0, 0, 0, 0];
+
+#[tokio::test]
+async fn close_without_go_away() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        // No GOAWAY: the connection just ends.
+        srv.recv_eof().await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .go_away_on_close(false)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let response = conn
+            .drive(client.get("https://example.com/"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        drop(client);
+        conn.await.unwrap();
+    };
+
+    join(srv, client).await;
+}
 
 trait MockH2 {
     fn handshake(&mut self) -> &mut Self;

@@ -114,6 +114,17 @@ pub(super) struct Stream {
 
     /// Validate content-length headers
     pub content_length: ContentLength,
+
+    /// Weight of the stream's HEADERS priority, when later streams chain
+    /// their dependencies to it.
+    pub dependency_weight: Option<u8>,
+
+    /// Increment of the WINDOW_UPDATE that goes out right after the stream's
+    /// HEADERS.
+    pub initial_window_update: Option<WindowSize>,
+
+    /// PING frame that goes out right after the stream's HEADERS.
+    pub ping_after_headers: Option<crate::frame::Ping>,
 }
 
 /// State related to validating a stream's content-length
@@ -194,6 +205,9 @@ impl Stream {
             push_task: None,
             pending_push_promises: store::Queue::new(),
             content_length: ContentLength::Omitted,
+            dependency_weight: None,
+            initial_window_update: None,
+            ping_after_headers: None,
         }
     }
 
@@ -341,11 +355,7 @@ impl Stream {
                 Some(val) => *rem = val,
                 None => return Err(()),
             },
-            ContentLength::Head => {
-                if len != 0 {
-                    return Err(());
-                }
-            }
+            ContentLength::Head if len != 0 => return Err(()),
             _ => {}
         }
 

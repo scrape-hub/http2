@@ -85,6 +85,14 @@
     clippy::undocumented_unsafe_blocks
 )]
 #![allow(clippy::type_complexity, clippy::manual_range_contains)]
+// Without the `tracing` feature, `crate::tracing`'s macros compile out to nothing, which can
+// make otherwise-different branches identical (their only difference was a trace message) and
+// their `let _span = ...` bindings unit-valued. With the feature on, both are real again and
+// clippy checks them normally.
+#![cfg_attr(
+    not(feature = "tracing"),
+    allow(clippy::let_unit_value, clippy::if_same_then_else)
+)]
 #![cfg_attr(test, deny(warnings))]
 
 mod tracing;

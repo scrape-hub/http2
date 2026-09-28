@@ -16,6 +16,8 @@ pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
 pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
 
+pub use self::flow_control::WindowUpdatePolicy;
+
 use self::buffer::Buffer;
 use self::counts::Counts;
 use self::flow_control::FlowControl;
@@ -82,6 +84,18 @@ pub struct Config {
 
     /// Priorities stream
     pub priorities: Option<Priorities>,
+
+    /// Chain each new stream's dependency to the open streams
+    pub stream_dependency_chain: bool,
+
+    /// WINDOW_UPDATE sent with the HEADERS of each new local stream
+    pub initial_stream_window_update: Option<WindowSize>,
+
+    /// When the receive window of a local stream is topped up
+    pub stream_window_update: Option<WindowUpdatePolicy>,
+
+    /// When the connection's receive window is topped up
+    pub connection_window_update: Option<WindowUpdatePolicy>,
 }
 
 trait DebugStructExt<'a, 'b> {

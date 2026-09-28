@@ -4,6 +4,12 @@ use crate::tracing;
 
 use std::fmt;
 
+// tokio::time::Instant wraps std::time::Instant and behaves identically to it
+// outside of a paused tokio-test clock; using it here (instead of
+// std::time::Instant) is what lets a test control this policy's timing with
+// tokio::time::pause()/advance() instead of a real sleep.
+use tokio::time::{Duration, Instant};
+
 // We don't want to send WINDOW_UPDATE frames for tiny changes, but instead
 // aggregate them when the changes are significant. Many implementations do
 // this by keeping a "ratio" of the update version the allowed window size.
@@ -27,6 +33,48 @@ fn sanity_unclaimed_ratio() {
     assert!(UNCLAIMED_DENOMINATOR > 0);
 }
 
+/// When a receive window is topped up with a WINDOW_UPDATE frame.
+///
+/// By default a WINDOW_UPDATE goes out once the capacity the application
+/// released reaches half of the window the peer still has. A policy replaces
+/// that rule: an update goes out once the released capacity reaches the
+/// [`threshold`](Self::threshold), once the peer's window falls to the
+/// [`low_window`](Self::low_window), or when capacity is released after the
+/// [`interval`](Self::interval) has passed since the last update. Each update
+/// returns all released capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowUpdatePolicy {
+    threshold: WindowSize,
+    low_window: Option<WindowSize>,
+    interval: Option<Duration>,
+}
+
+impl WindowUpdatePolicy {
+    /// Send a WINDOW_UPDATE once `bytes` of released capacity add up.
+    pub fn threshold(bytes: u32) -> Self {
+        WindowUpdatePolicy {
+            threshold: bytes,
+            low_window: None,
+            interval: None,
+        }
+    }
+
+    /// Also send one as soon as the window the peer knows is down to `bytes`
+    /// or less (and some capacity was released).
+    pub fn low_window(mut self, bytes: u32) -> Self {
+        self.low_window = Some(bytes);
+        self
+    }
+
+    /// Also send one when capacity is released and `interval` has passed
+    /// since the last WINDOW_UPDATE of the window (since its creation before
+    /// the first).
+    pub fn interval(mut self, interval: Duration) -> Self {
+        self.interval = Some(interval);
+        self
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct FlowControl {
     /// Window the peer knows about.
@@ -47,6 +95,16 @@ pub struct FlowControl {
     /// This can go negative if a user declares a smaller target window than
     /// the peer knows about.
     available: Window,
+
+    /// When a receive window sends WINDOW_UPDATE frames; `None` for the
+    /// default ratio.
+    update_policy: Option<WindowUpdatePolicy>,
+
+    /// When the last WINDOW_UPDATE went out, or when the policy was set.
+    last_update: Option<Instant>,
+
+    /// A WINDOW_UPDATE is due whatever the threshold says.
+    update_due: bool,
 }
 
 impl FlowControl {
@@ -54,6 +112,42 @@ impl FlowControl {
         FlowControl {
             window_size: Window(0),
             available: Window(0),
+            update_policy: None,
+            last_update: None,
+            update_due: false,
+        }
+    }
+
+    /// Replace the default WINDOW_UPDATE rule of a receive window.
+    pub fn set_update_policy(&mut self, policy: WindowUpdatePolicy) {
+        self.update_policy = Some(policy);
+        self.last_update = Some(Instant::now());
+    }
+
+    /// Capacity was released: with an interval policy, an update is due if
+    /// the interval has passed.
+    pub fn note_release(&mut self) {
+        let interval = self.update_policy.and_then(|policy| policy.interval);
+        if let (Some(interval), Some(last)) = (interval, self.last_update) {
+            if last.elapsed() >= interval {
+                self.update_due = true;
+            }
+        }
+    }
+
+    /// With a policy, send the next WINDOW_UPDATE regardless of its
+    /// threshold. The default rule is left as it is.
+    pub fn force_update(&mut self) {
+        if self.update_policy.is_some() {
+            self.update_due = true;
+        }
+    }
+
+    /// A WINDOW_UPDATE for this window went out.
+    pub fn window_update_sent(&mut self) {
+        self.update_due = false;
+        if self.update_policy.is_some() {
+            self.last_update = Some(Instant::now());
         }
     }
 
@@ -99,12 +193,21 @@ impl FlowControl {
         }
 
         let unclaimed = available.0 - self.window_size.0;
-        let threshold = self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR;
+        let due = match self.update_policy {
+            None => unclaimed >= self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR,
+            Some(policy) => {
+                self.update_due
+                    || unclaimed as WindowSize >= policy.threshold
+                    || policy
+                        .low_window
+                        .map_or(false, |low| self.window_size.0 <= low as i32)
+            }
+        };
 
-        if unclaimed < threshold {
-            None
-        } else {
+        if due {
             Some(unclaimed as WindowSize)
+        } else {
+            None
         }
     }
 

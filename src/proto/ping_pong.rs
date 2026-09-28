@@ -6,7 +6,7 @@ use crate::tracing;
 use atomic_waker::AtomicWaker;
 use bytes::Buf;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
@@ -28,6 +28,8 @@ struct UserPingsRx(Arc<UserPingsInner>);
 #[derive(Debug)]
 struct UserPingsInner {
     state: AtomicUsize,
+    /// Payload of the user PING, as a big-endian `u64`.
+    payload: AtomicU64,
     /// Task to wake up the main `Connection`.
     ping_task: AtomicWaker,
     /// Task to wake up `share::PingPong::poll_pong`.
@@ -78,6 +80,7 @@ impl PingPong {
 
         let user_pings = Arc::new(UserPingsInner {
             state: AtomicUsize::new(USER_STATE_EMPTY),
+            payload: AtomicU64::new(u64::from_be_bytes(Ping::USER)),
             ping_task: AtomicWaker::new(),
             pong_task: AtomicWaker::new(),
         });
@@ -117,7 +120,7 @@ impl PingPong {
             }
 
             if let Some(ref users) = self.user_pings {
-                if ping.payload() == &Ping::USER && users.receive_pong() {
+                if ping.payload() == &users.payload() && users.receive_pong() {
                     tracing::trace!("recv PING USER ack");
                     return ReceivedPing::Unknown;
                 }
@@ -184,7 +187,7 @@ impl PingPong {
                     return Poll::Pending;
                 }
 
-                dst.buffer(Ping::new(Ping::USER).into())
+                dst.buffer(Ping::new(users.payload()).into())
                     .expect("invalid ping frame");
                 users
                     .0
@@ -208,7 +211,14 @@ impl ReceivedPing {
 // ===== impl UserPings =====
 
 impl UserPings {
-    pub(crate) fn send_ping(&self) -> Result<(), Option<proto::Error>> {
+    pub(crate) fn send_ping(&self, payload: PingPayload) -> Result<(), Option<proto::Error>> {
+        // Only this handle moves the state away from EMPTY, and the
+        // connection reads the payload only after it did.
+        if self.0.state.load(Ordering::Acquire) == USER_STATE_EMPTY {
+            self.0
+                .payload
+                .store(u64::from_be_bytes(payload), Ordering::Release);
+        }
         let prev = self
             .0
             .state
@@ -259,6 +269,10 @@ impl UserPings {
 // ===== impl UserPingsRx =====
 
 impl UserPingsRx {
+    fn payload(&self) -> PingPayload {
+        self.0.payload.load(Ordering::Acquire).to_be_bytes()
+    }
+
     fn receive_pong(&self) -> bool {
         let prev = self
             .0

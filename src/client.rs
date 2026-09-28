@@ -146,6 +146,9 @@ use crate::frame::{
 use crate::proto::{self, Error};
 use crate::{tracing, FlowControl, PingPong, RecvStream, SendStream};
 
+pub use crate::hpack::HeaderCompression;
+pub use crate::proto::WindowUpdatePolicy;
+
 #[cfg(feature = "tracing")]
 use ::tracing::Instrument;
 use bytes::{Buf, Bytes};
@@ -358,6 +361,37 @@ pub struct Builder {
 
     /// Priority stream list
     priorities: Option<Priorities>,
+
+    /// Chain each new stream's dependency to the open streams
+    stream_dependency_chain: bool,
+
+    /// Receive window each new stream is raised to right after its HEADERS
+    initial_stream_window_size: Option<u32>,
+
+    /// When the receive window of a stream is topped up
+    stream_window_update: Option<WindowUpdatePolicy>,
+
+    /// When the connection's receive window is topped up
+    connection_window_update: Option<WindowUpdatePolicy>,
+
+    /// How header blocks are compressed
+    header_compression: HeaderCompression,
+
+    /// Write each frame with a write call of its own
+    write_frames_individually: bool,
+
+    /// With `write_frames_individually`: write the preface on its own
+    write_preface_alone: bool,
+
+    /// With `write_frames_individually`: a stream's first DATA frame goes
+    /// with its HEADERS
+    write_data_with_headers: bool,
+
+    /// Largest frame a header block is split into
+    max_header_frame_size: Option<u32>,
+
+    /// Whether a graceful close sends GOAWAY
+    go_away_on_close: bool,
 }
 
 #[derive(Debug)]
@@ -563,6 +597,17 @@ where
         self.inner.is_extended_connect_protocol_enabled()
     }
 
+    /// Polls until the server's initial `SETTINGS` frame has been received
+    /// and applied, so that settings such as
+    /// [`is_extended_connect_protocol_enabled`](Self::is_extended_connect_protocol_enabled)
+    /// report the server's values rather than the defaults.
+    ///
+    /// The connection must be driven for the frame to arrive. Fails with the
+    /// connection's error if it ends first.
+    pub fn poll_remote_settings(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), crate::Error>> {
+        self.inner.poll_remote_settings(cx).map_err(Into::into)
+    }
+
     /// Returns the current max send streams
     pub fn current_max_send_streams(&self) -> usize {
         self.inner.current_max_send_streams()
@@ -681,6 +726,16 @@ impl Builder {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
+            stream_dependency_chain: false,
+            initial_stream_window_size: None,
+            stream_window_update: None,
+            connection_window_update: None,
+            header_compression: HeaderCompression::Default,
+            write_frames_individually: false,
+            write_preface_alone: false,
+            write_data_with_headers: false,
+            max_header_frame_size: None,
+            go_away_on_close: true,
         }
     }
 
@@ -1220,7 +1275,7 @@ impl Builder {
     /// are encoded in the HEADERS frame. Customizing the order may be useful for interoperability
     /// or testing purposes.
     pub fn headers_pseudo_order(&mut self, order: PseudoOrder) -> &mut Self {
-        self.headers_pseudo_order = Some(order.into());
+        self.headers_pseudo_order = Some(order);
         self
     }
 
@@ -1229,8 +1284,132 @@ impl Builder {
     /// This configures the priority of the stream by specifying its dependency and weight,
     /// as defined by the HTTP/2 priority mechanism. This can be used to influence how the
     /// server allocates resources to this stream relative to others.
+    ///
+    /// A `StreamDependency` in the extensions of a request replaces this one
+    /// for that request.
     pub fn headers_stream_dependency(&mut self, stream_dependency: StreamDependency) -> &mut Self {
         self.headers_stream_dependency = Some(stream_dependency);
+        self
+    }
+
+    /// Chains the dependencies of new streams as Chromium does
+    /// (`Http2PriorityDependencies`).
+    ///
+    /// A request's stream dependency, from its extensions or
+    /// [`headers_stream_dependency`](Self::headers_stream_dependency), keeps
+    /// its weight and exclusive flag but points to the most recently opened
+    /// stream that is still open among those with the lowest weight not
+    /// below its own, or to stream 0 when there is none.
+    ///
+    /// Disabled by default.
+    pub fn stream_dependency_chain(&mut self, enabled: bool) -> &mut Self {
+        self.stream_dependency_chain = enabled;
+        self
+    }
+
+    /// Raises the receive window of each stream the client opens to `size`
+    /// right away: a WINDOW_UPDATE for the stream follows its HEADERS frame
+    /// directly, with the increment from the advertised
+    /// [`initial_window_size`](Self::initial_window_size) to `size`.
+    ///
+    /// By default a stream's window is the advertised initial window size.
+    ///
+    /// # Panics
+    ///
+    /// When `size` is larger than 2^31-1.
+    pub fn initial_stream_window_size(&mut self, size: u32) -> &mut Self {
+        assert!(size <= proto::MAX_WINDOW_SIZE);
+        self.initial_stream_window_size = Some(size);
+        self
+    }
+
+    /// Sets when the receive window of a stream is topped up with a
+    /// WINDOW_UPDATE frame.
+    ///
+    /// By default an update goes out once the released capacity reaches half
+    /// of the window the peer still has.
+    pub fn stream_window_update(&mut self, policy: WindowUpdatePolicy) -> &mut Self {
+        self.stream_window_update = Some(policy);
+        self
+    }
+
+    /// Sets when the connection's receive window is topped up with a
+    /// WINDOW_UPDATE frame. The update that raises the window to
+    /// [`initial_connection_window_size`](Self::initial_connection_window_size)
+    /// goes out regardless.
+    ///
+    /// By default an update goes out once the released capacity reaches half
+    /// of the window the peer still has.
+    pub fn connection_window_update(&mut self, policy: WindowUpdatePolicy) -> &mut Self {
+        self.connection_window_update = Some(policy);
+        self
+    }
+
+    /// Sets how the header blocks of requests are compressed.
+    ///
+    /// The default is this crate's own HPACK encoder.
+    pub fn header_compression(&mut self, compression: HeaderCompression) -> &mut Self {
+        self.header_compression = compression;
+        self
+    }
+
+    /// Writes each frame to the I/O with a write call of its own instead of
+    /// all frames buffered at a time with one call. Over TLS, each write call
+    /// becomes a TLS record of its own.
+    ///
+    /// A HEADERS frame goes out together with its CONTINUATION frames and a
+    /// WINDOW_UPDATE for its stream that follows it (see
+    /// [`initial_stream_window_size`](Self::initial_stream_window_size)).
+    /// The connection preface goes out with the initial SETTINGS frame and
+    /// the connection WINDOW_UPDATE that follows it, when the connection is
+    /// first polled rather than in the handshake.
+    ///
+    /// Disabled by default.
+    pub fn write_frames_individually(&mut self, enabled: bool) -> &mut Self {
+        self.write_frames_individually = enabled;
+        self
+    }
+
+    /// With [`write_frames_individually`](Self::write_frames_individually),
+    /// writes the connection preface with a write call of its own in the
+    /// handshake, so that the initial SETTINGS frame and the connection
+    /// WINDOW_UPDATE go out in writes of their own as well (OkHttp flushes
+    /// each of them).
+    ///
+    /// Disabled by default.
+    pub fn write_preface_alone(&mut self, enabled: bool) -> &mut Self {
+        self.write_preface_alone = enabled;
+        self
+    }
+
+    /// With [`write_frames_individually`](Self::write_frames_individually),
+    /// writes the first DATA frame of a request body together with the
+    /// request's HEADERS frame when both are queued at once (OkHttp flushes
+    /// the HEADERS of a request with a body only with the body).
+    ///
+    /// Disabled by default.
+    pub fn write_data_with_headers(&mut self, enabled: bool) -> &mut Self {
+        self.write_data_with_headers = enabled;
+        self
+    }
+
+    /// Splits the header block of a request into HEADERS and CONTINUATION
+    /// frames of at most `size` bytes of payload, also when the peer's
+    /// SETTINGS_MAX_FRAME_SIZE allows larger frames.
+    ///
+    /// By default the peer's maximum frame size applies.
+    pub fn max_header_frame_size(&mut self, size: u32) -> &mut Self {
+        self.max_header_frame_size = Some(size);
+        self
+    }
+
+    /// Sets whether the client sends a GOAWAY frame before it closes a
+    /// connection without error, such as when its last handle is dropped
+    /// with no stream open. Without it, the client just shuts the I/O down.
+    ///
+    /// Enabled by default.
+    pub fn go_away_on_close(&mut self, enabled: bool) -> &mut Self {
+        self.go_away_on_close = enabled;
         self
     }
 
@@ -1386,8 +1565,9 @@ where
 {
     tracing::debug!("binding client connection");
 
-    let msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    io.write_all(msg).await.map_err(crate::Error::from_io)?;
+    io.write_all(crate::frame::PREFACE)
+        .await
+        .map_err(crate::Error::from_io)?;
 
     tracing::debug!("client connection bound");
 
@@ -1403,10 +1583,27 @@ where
         mut io: T,
         builder: Builder,
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
-        bind_connection(&mut io).await?;
+        let preface_with_settings =
+            builder.write_frames_individually && !builder.write_preface_alone;
+        if !preface_with_settings {
+            bind_connection(&mut io).await?;
+        }
 
         // Create the codec
         let mut codec = Codec::new(io);
+
+        if builder.write_frames_individually {
+            codec.set_write_frames_individually(true);
+            codec.set_data_joins_headers(builder.write_data_with_headers);
+        }
+        if preface_with_settings {
+            // The preface goes out with the SETTINGS frame.
+            codec.buffer_preface();
+        }
+        if let Some(size) = builder.max_header_frame_size {
+            codec.set_max_header_frame_size(size as usize);
+        }
+        codec.set_header_compression(builder.header_compression);
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
@@ -1435,6 +1632,20 @@ where
                 headers_pseudo_order: builder.headers_pseudo_order,
                 headers_stream_dependency: builder.headers_stream_dependency,
                 priorities: builder.priorities,
+                stream_dependency_chain: builder.stream_dependency_chain,
+                initial_stream_window_update: builder
+                    .initial_stream_window_size
+                    .map(|size| {
+                        let advertised = builder
+                            .settings
+                            .initial_window_size()
+                            .unwrap_or(crate::frame::DEFAULT_INITIAL_WINDOW_SIZE);
+                        size.saturating_sub(advertised)
+                    })
+                    .filter(|incr| *incr > 0),
+                stream_window_update: builder.stream_window_update,
+                connection_window_update: builder.connection_window_update,
+                go_away_on_close: builder.go_away_on_close,
             },
         );
         let send_request = SendRequest {

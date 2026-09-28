@@ -73,6 +73,9 @@ pub use self::window_update::WindowUpdate;
 #[cfg(feature = "unstable")]
 pub use crate::hpack::BytesStr;
 
+/// The client connection preface (RFC 9113 §3.4).
+pub(crate) const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
 // Re-export some constants
 
 pub use self::settings::{

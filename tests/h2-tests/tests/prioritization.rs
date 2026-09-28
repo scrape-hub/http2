@@ -508,3 +508,210 @@ async fn stream_count_over_max_stream_limit_does_not_starve_capacity() {
 
     select(task, t).await;
 }
+
+fn request_with_dependency(path: &str, weight: u8) -> Request<()> {
+    Request::builder()
+        .uri(format!("https://example.com{path}"))
+        .extension(h2::frame::StreamDependency::new(
+            StreamId::ZERO,
+            weight,
+            true,
+        ))
+        .body(())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn request_dependency_chains_to_open_streams() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        // Nothing open: the first stream depends on stream 0.
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/a")
+                .stream_dependency(0, 255, true)
+                .eos(),
+        )
+        .await;
+        // Lower weight: the open stream 1.
+        srv.recv_frame(
+            frames::headers(3)
+                .request("GET", "https://example.com/b")
+                .stream_dependency(1, 219, true)
+                .eos(),
+        )
+        .await;
+        // Same weight as 3: the latest stream of that weight.
+        srv.recv_frame(
+            frames::headers(5)
+                .request("GET", "https://example.com/c")
+                .stream_dependency(3, 219, true)
+                .eos(),
+        )
+        .await;
+        // Highest weight: stream 1, although 3 and 5 are newer.
+        srv.recv_frame(
+            frames::headers(7)
+                .request("GET", "https://example.com/d")
+                .stream_dependency(1, 255, true)
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(5).response(200).eos()).await;
+        srv.send_frame(frames::headers(3).response(200).eos()).await;
+        // 3 and 5 are closed: the lowest open weight above 182 is 255.
+        srv.recv_frame(
+            frames::headers(9)
+                .request("GET", "https://example.com/e")
+                .stream_dependency(7, 182, true)
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        srv.send_frame(frames::headers(7).response(200).eos()).await;
+        srv.send_frame(frames::headers(9).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::Builder::new()
+            .stream_dependency_chain(true)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+
+        let mut send = |path: &str, weight: u8| {
+            client
+                .send_request(request_with_dependency(path, weight), true)
+                .unwrap()
+                .0
+        };
+        let a = send("/a", 255);
+        let b = send("/b", 219);
+        let c = send("/c", 219);
+        let d = send("/d", 255);
+        h2.drive(c).await.unwrap();
+        h2.drive(b).await.unwrap();
+        let e = send("/e", 182);
+        h2.drive(a).await.unwrap();
+        h2.drive(d).await.unwrap();
+        h2.drive(e).await.unwrap();
+        drop(send);
+        drop(client);
+        h2.await.expect("client");
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn request_dependency_replaces_connection_dependency() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .stream_dependency(0, 41, false)
+                .eos(),
+        )
+        .await;
+        srv.recv_frame(
+            frames::headers(3)
+                .request("GET", "https://example.com/img")
+                .stream_dependency(0, 11, false)
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        srv.send_frame(frames::headers(3).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::Builder::new()
+            .headers_stream_dependency(h2::frame::StreamDependency::new(StreamId::ZERO, 41, false))
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+
+        let (first, _) = client
+            .send_request(Request::get("https://example.com/").body(()).unwrap(), true)
+            .unwrap();
+        let image = Request::builder()
+            .uri("https://example.com/img")
+            .extension(h2::frame::StreamDependency::new(StreamId::ZERO, 11, false))
+            .body(())
+            .unwrap();
+        let (second, _) = client.send_request(image, true).unwrap();
+        h2.drive(first).await.unwrap();
+        h2.drive(second).await.unwrap();
+        drop(client);
+        h2.await.expect("client");
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn priority_frames_go_out_once() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let priority = |id: u32| {
+        h2::frame::Priority::new(
+            id.into(),
+            h2::frame::StreamDependency::new(StreamId::ZERO, 200, false),
+        )
+    };
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(priority(3)).await;
+        srv.recv_frame(priority(5)).await;
+        srv.recv_frame(
+            frames::headers(7)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(7).response(200).eos()).await;
+        // The second request comes without PRIORITY frames.
+        srv.recv_frame(
+            frames::headers(9)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(9).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::Builder::new()
+            .initial_stream_id(7)
+            .priorities(
+                h2::frame::Priorities::builder()
+                    .push(priority(3))
+                    .push(priority(5))
+                    .build(),
+            )
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+
+        for _ in 0..2 {
+            let res = h2.drive(client.get("https://example.com/")).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        drop(client);
+        h2.await.expect("client");
+    };
+
+    join(srv, h2).await;
+}

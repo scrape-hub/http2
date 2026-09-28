@@ -206,7 +206,7 @@ pub struct PingPong {
 ///
 /// [`PingPong`]: struct.PingPong.html
 pub struct Ping {
-    _p: (),
+    payload: [u8; 8],
 }
 
 /// Received via [`PingPong`][] when a peer acknowledges a [`Ping`][].
@@ -354,6 +354,27 @@ impl<B: Buf> SendStream<B> {
     /// [`Error`]: struct.Error.html
     pub fn send_reset(&mut self, reason: Reason) {
         self.inner.send_reset(reason)
+    }
+
+    /// Resets the stream once the data queued for it is written: a
+    /// RST_STREAM frame with `reason` follows that data, where
+    /// [`send_reset`](Self::send_reset) drops it. Safari resets its WebSocket
+    /// streams so right after the Close frame that completes the closing
+    /// handshake.
+    pub fn send_reset_after_data(&mut self, reason: Reason) {
+        self.inner.send_reset_after_data(reason)
+    }
+
+    /// Stops sending on a stream the peer has ended (half-closed remote)
+    /// without the END_STREAM or RST_STREAM that would close it on the wire:
+    /// data still queued is dropped, the stream closes locally, and the peer
+    /// keeps its half of the stream open. Chromium up to version 153 ends
+    /// HTTP/2 WebSocket streams so, and Firefox too.
+    ///
+    /// Returns whether the stream is closed. A stream the peer has not ended,
+    /// or whose HEADERS are still queued, is left as it is.
+    pub fn abandon(&mut self) -> bool {
+        self.inner.abandon()
     }
 
     /// Polls to be notified when the client resets this stream.
@@ -554,12 +575,7 @@ impl PingPong {
 
     #[doc(hidden)]
     pub fn send_ping(&mut self, ping: Ping) -> Result<(), crate::Error> {
-        // Passing a `Ping` here is just to be forwards-compatible with
-        // eventually allowing choosing a ping payload. For now, we can
-        // just ignore it.
-        let _ = ping;
-
-        self.inner.send_ping().map_err(|err| match err {
+        self.inner.send_ping(ping.payload).map_err(|err| match err {
             Some(err) => err.into(),
             None => UserError::SendPingWhilePending.into(),
         })
@@ -587,7 +603,17 @@ impl Ping {
     ///
     /// [`PingPong`]: struct.PingPong.html
     pub fn opaque() -> Ping {
-        Ping { _p: () }
+        Ping {
+            payload: crate::frame::Ping::USER,
+        }
+    }
+
+    /// Creates a `Ping` that carries `payload` as its opaque data.
+    ///
+    /// The payload must differ from that of any other PING the connection
+    /// has outstanding.
+    pub fn with_payload(payload: [u8; 8]) -> Ping {
+        Ping { payload }
     }
 }
 
