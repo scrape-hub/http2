@@ -19,6 +19,9 @@ frames of Chrome, Firefox, Safari and OkHttp.
   END_STREAM or RST_STREAM.
 * `Ping::with_payload` sends a PING with a chosen payload.
 * `PseudoOrder::builder` and `PseudoOrderBuilder` are documented.
+* A connection holds no read or write buffer while it waits: the write buffer
+  (16 KB) is released once flushed and the read buffer (8 KB) while no data is
+  pending, and both are allocated again when needed, as Chrome's sockets do.
 
 # 0.4.13 (January 5, 2026)
 

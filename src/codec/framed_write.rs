@@ -259,7 +259,8 @@ where
     fn unset_frame(&mut self) -> ControlFlow {
         // Clear internal buffer
         self.buf.set_position(0);
-        self.buf.get_mut().clear();
+        // An idle connection holds no write buffer; the next frame allocates it again.
+        *self.buf.get_mut() = BytesMut::new();
         self.write_ends.clear();
 
         // The data frame has been written, so unset it
@@ -284,6 +285,9 @@ where
     fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
         // Ensure that we have enough capacity to accept the write.
         assert!(self.has_capacity());
+        if self.buf.get_ref().capacity() == 0 {
+            self.buf.get_mut().reserve(DEFAULT_BUFFER_CAPACITY);
+        }
         let _span = tracing::trace_span!("FramedWrite::buffer", frame = ?item);
 
         tracing::debug!(frame = ?item, "send");
@@ -396,8 +400,9 @@ where
 
     fn has_capacity(&self) -> bool {
         self.next.is_none()
-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
-                >= self.min_buffer_capacity)
+            && (self.buf.get_ref().is_empty()
+                || self.buf.get_ref().capacity() - self.buf.get_ref().len()
+                    >= self.min_buffer_capacity)
     }
 
     fn is_empty(&self) -> bool {

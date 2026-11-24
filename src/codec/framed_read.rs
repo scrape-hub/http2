@@ -22,6 +22,9 @@ use tokio_util::codec::{LengthDelimitedCodec, LengthDelimitedCodecError};
 // 16 MB "sane default" taken from golang http2
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
 
+/// The read buffer a connection allocates when data may arrive (tokio-util's initial size).
+const READ_BUFFER_CAPACITY: usize = 8 * 1024;
+
 #[derive(Debug)]
 pub struct FramedRead<T> {
     inner: InnerFramedRead<T, LengthDelimitedCodec>,
@@ -379,10 +382,21 @@ where
         let _span = tracing::trace_span!("FramedRead::poll_next");
         loop {
             tracing::trace!("poll");
-            let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
-                Some(Ok(bytes)) => bytes,
-                Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
-                None => return Poll::Ready(None),
+            if self.inner.read_buffer().capacity() == 0 {
+                self.inner.read_buffer_mut().reserve(READ_BUFFER_CAPACITY);
+            }
+            let bytes = match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => bytes,
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(map_err(e)))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => {
+                    // A connection waiting for data holds no read buffer, like Chrome's
+                    // `Socket::ReadIfReady`.
+                    if self.inner.read_buffer().is_empty() {
+                        *self.inner.read_buffer_mut() = BytesMut::new();
+                    }
+                    return Poll::Pending;
+                }
             };
 
             tracing::trace!(read.bytes = bytes.len());
