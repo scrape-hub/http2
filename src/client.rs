@@ -1628,7 +1628,6 @@ where
                 reset_stream_max: builder.reset_stream_max,
                 remote_reset_stream_max: builder.pending_accept_reset_stream_max,
                 local_error_reset_streams_max: builder.local_max_error_reset_streams,
-                settings: builder.settings.clone(),
                 headers_pseudo_order: builder.headers_pseudo_order,
                 headers_stream_dependency: builder.headers_stream_dependency,
                 priorities: builder.priorities,
@@ -1646,6 +1645,7 @@ where
                 stream_window_update: builder.stream_window_update,
                 connection_window_update: builder.connection_window_update,
                 go_away_on_close: builder.go_away_on_close,
+                settings: builder.settings,
             },
         );
         let send_request = SendRequest {

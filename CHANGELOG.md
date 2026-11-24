@@ -23,6 +23,27 @@ frames of Chrome, Firefox, Safari and OkHttp.
   (16 KB) is released once flushed and the read buffer (8 KB) while no data is
   pending, and both are allocated again when needed, as Chrome's sockets do.
 
+# 0.4.15 (June 15, 2026)
+
+* Fix closing a connection when header size is "way too large" (currently x4 configured limit).
+* Fix overflow calculating padding length if a DATA frame had 255 bytes of padding.
+* Fix ignoring library-initiated resets in the connection state loop.
+* Fix decoding panic with an absurd amount of headers and no limit to now use `try_append()`.
+* Fix rejecting frames on streams whose HEADERS have not been sent.
+* Fix `poll_capacity()` to not return `Some(Ok(0))`.
+* Fix discarding of buffered DATA frames when a reset is scheduled.
+
+# 0.4.14 (May 5, 2026)
+
+* Add `header_table_size()` option to server builder.
+* Fix leaking connection flow control of padded DATA frames when stream is reset.
+* Fix leaking connection flow control when canceling a stream after reserving capacity.
+* Fix leaking connection flow control when receiving a DATA frame after GOAWAY.
+* Fix waking the `poll_capacity` when locally reseting a stream from library.
+* Fix sending HEADERS on a reset stream before the RST_STREAM frame.
+* Fix receiving GOAWAY to not close peer-initiated streams.
+* Optimize header value decoding to copy less bytes.
+
 # 0.4.13 (January 5, 2026)
 
 * Add support for 1xx informational responses on client and server side.

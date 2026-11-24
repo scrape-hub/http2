@@ -584,6 +584,7 @@ mod test {
                 let name = String::from_utf8(header.name().as_slice().to_vec()).unwrap();
                 let value = String::from_utf8(header.value_slice().to_vec()).unwrap();
                 out.push((name, value));
+                std::ops::ControlFlow::Continue(())
             })
             .unwrap();
         out

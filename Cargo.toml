@@ -3,9 +3,13 @@ name = "http2"
 # When releasing to crates.io:
 # - Update CHANGELOG.md.
 # - Create git tag
-version = "0.5.12"
+version = "0.5.20"
 license = "MIT"
-authors = ["0x676e67 <gngppz@gmail.com>"]
+authors = [
+    "0x676e67 <gngppz@gmail.com>",
+    "Carl Lerche <me@carllerche.com>",
+    "Sean McArthur <sean@seanmonstar.com>",
+]
 description = "An HTTP/2 client and server"
 documentation = "https://docs.rs/http2"
 repository = "https://github.com/0x676e67/http2"
@@ -47,8 +51,8 @@ futures-core = { version = "0.3", default-features = false }
 futures-sink = { version = "0.3", default-features = false }
 tokio-util = { version = "0.7.1", features = ["codec", "io"] }
 tokio = { version = "1", features = ["io-util", "time"] }
-bytes = "1"
-http = "1"
+bytes = "1.11.1"
+http = "1.4.2"
 tracing = { version = "0.1", default-features = false, features = [
     "std",
 ], optional = true }
