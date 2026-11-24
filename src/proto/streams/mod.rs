@@ -14,7 +14,7 @@ mod sync;
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
-pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
+pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamRef, Streams};
 
 pub use self::flow_control::WindowUpdatePolicy;
 
@@ -33,6 +33,12 @@ use crate::proto::*;
 
 use bytes::Bytes;
 use std::time::Duration;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum BufferStatus {
+    Complete,
+    CodecFull,
+}
 
 #[derive(Debug)]
 pub struct Config {
@@ -96,6 +102,8 @@ pub struct Config {
 
     /// When the connection's receive window is topped up
     pub connection_window_update: Option<WindowUpdatePolicy>,
+    /// Connection-level budget policy for DATA framing overhead.
+    pub(crate) data_frame_budget: DataFrameBudget,
 }
 
 trait DebugStructExt<'a, 'b> {

@@ -1,7 +1,104 @@
 use futures::{StreamExt, TryStreamExt};
 use h2_support::prelude::*;
 use h2_support::util::yield_once;
+use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc, Barrier,
+};
+use std::task::{Context, Poll};
 use tokio::sync::oneshot;
+
+const LOST_WAKE_FIRST_DATA: &[u8] = b"lost-wakeup-first-data";
+const LOST_WAKE_SECOND_DATA: &[u8] = b"lost-wakeup-second-data";
+
+#[derive(Clone)]
+struct FlushInterleave {
+    state: Arc<AtomicU8>,
+    entered: Arc<Barrier>,
+    resume: Arc<Barrier>,
+}
+
+impl FlushInterleave {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(0)),
+            entered: Arc::new(Barrier::new(2)),
+            resume: Arc::new(Barrier::new(2)),
+        }
+    }
+
+    fn arm(&self) {
+        assert_eq!(self.state.swap(1, Ordering::SeqCst), 0);
+    }
+
+    fn observe_write(&self, buf: &[u8]) {
+        if buf
+            .windows(LOST_WAKE_FIRST_DATA.len())
+            .any(|window| window == LOST_WAKE_FIRST_DATA)
+        {
+            let _ = self
+                .state
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
+    fn block_flush(&self) {
+        if self
+            .state
+            .compare_exchange(2, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.entered.wait();
+            self.resume.wait();
+        }
+    }
+
+    fn wait_for_flush(&self) {
+        self.entered.wait();
+    }
+
+    fn resume_flush(&self) {
+        self.resume.wait();
+    }
+}
+
+struct FlushInterleaveIo {
+    inner: mock::Mock,
+    interleave: FlushInterleave,
+}
+
+impl AsyncRead for FlushInterleaveIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio_io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for FlushInterleaveIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.interleave.observe_write(buf);
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.interleave.block_flush();
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
 
 // In this case, the stream & connection both have capacity, but capacity is not
 // explicitly requested.
@@ -447,6 +544,61 @@ async fn stream_error_release_connection_capacity() {
     join(srv, client).await;
 }
 
+#[tokio::test]
+async fn recv_stream_drop_releases_only_buffered_connection_capacity() {
+    h2_support::trace_init!();
+
+    const FRAME_LEN: usize = 16_384;
+    const TOTAL_LEN: usize = FRAME_LEN * 2;
+
+    // Exercise all relationships between buffered and in-flight capacity:
+    // equal, buffered > in-flight, and buffered < in-flight.
+    for read_frames in 0usize..=1 {
+        for released_frames in 0usize..=1 {
+            let expected_used = read_frames.saturating_sub(released_frames) * FRAME_LEN;
+            let (io, mut peer) = mock::new();
+
+            let peer = async move {
+                let _ = peer.assert_server_handshake().await;
+                peer.send_frame(frames::headers(1).request("POST", "https://example.com/"))
+                    .await;
+                for _ in 0..2 {
+                    peer.send_frame(frames::data(1, vec![0; FRAME_LEN])).await;
+                }
+
+                peer.recv_frame(frames::window_update(0, (TOTAL_LEN - expected_used) as u32))
+                    .await;
+                if released_frames > 0 {
+                    peer.recv_frame(frames::window_update(1, FRAME_LEN as u32))
+                        .await;
+                }
+            };
+
+            let server = async move {
+                let mut server = server::handshake(io).await.unwrap();
+                let (request, _respond) = server.next().await.unwrap().unwrap();
+                let mut body = request.into_body();
+
+                for _ in 0..read_frames {
+                    assert_eq!(body.data().await.unwrap().unwrap().len(), FRAME_LEN);
+                }
+
+                let mut flow = body.flow_control().clone();
+                for _ in 0..released_frames {
+                    flow.release_capacity(FRAME_LEN).unwrap();
+                }
+                drop(body);
+
+                assert_eq!(flow.used_capacity(), expected_used);
+
+                let _ = server.next().await;
+            };
+
+            join(peer, server).await;
+        }
+    }
+}
+
 // Regression test for TODO
 #[tokio::test]
 async fn padded_data_stream_error_releases_connection_capacity() {
@@ -833,6 +985,112 @@ async fn recv_window_update_on_stream_closed_by_data_frame() {
         srv.recv_frame(frames::data(1, "hello").eos()).await;
         srv.send_frame(frames::window_update(1, 5)).await;
     };
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn small_data_frames_reclaimed_before_buffering_next() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let (response, mut stream) = client.send_request(request, false).unwrap();
+
+        stream.send_data("hello".into(), false).unwrap();
+        stream.send_data("world".into(), true).unwrap();
+
+        let response = h2.drive(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        h2.await.unwrap();
+    };
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+            .await;
+        srv.recv_frame(frames::data(1, "hello")).await;
+        srv.recv_frame(frames::data(1, "world").eos()).await;
+        srv.send_frame(frames::headers(1).response(204).eos()).await;
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn send_enqueued_during_unlocked_flush_wakes_connection() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let interleave = FlushInterleave::new();
+    let io = FlushInterleaveIo {
+        inner: io,
+        interleave: interleave.clone(),
+    };
+    let (headers_received_tx, headers_received_rx) = oneshot::channel();
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let (response, mut stream) = client.send_request(request, false).unwrap();
+
+        // Ensure the connection has finished flushing HEADERS and registered
+        // its stream waker before the first DATA frame consumes that waker.
+        h2.drive(headers_received_rx).await.unwrap();
+
+        interleave.arm();
+        stream
+            .send_data(LOST_WAKE_FIRST_DATA.into(), false)
+            .unwrap();
+
+        let producer_interleave = interleave.clone();
+        let producer = thread::spawn(move || {
+            producer_interleave.wait_for_flush();
+            let result = stream.send_data(LOST_WAKE_SECOND_DATA.into(), true);
+            producer_interleave.resume_flush();
+            result.unwrap();
+        });
+
+        let response = {
+            // Suppress unrelated/spurious connection polls so only a wake
+            // registered during the critical flush interval can make progress.
+            let mut woken_h2 = (&mut h2).wakened();
+            tokio::time::timeout(Duration::from_secs(5), woken_h2.drive(response))
+                .await
+                .expect("connection was not woken for DATA queued during flush")
+                .unwrap()
+        };
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        producer.join().unwrap();
+        drop(client);
+        h2.await.unwrap();
+    };
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+            .await;
+        headers_received_tx.send(()).unwrap();
+        srv.recv_frame(frames::data(1, LOST_WAKE_FIRST_DATA)).await;
+        srv.recv_frame(frames::data(1, LOST_WAKE_SECOND_DATA).eos())
+            .await;
+        srv.send_frame(frames::headers(1).response(204).eos()).await;
+    };
+
     join(srv, h2).await;
 }
 
@@ -1568,6 +1826,79 @@ async fn client_decrease_initial_window_size() {
     join(srv, client).await;
 }
 
+#[tokio::test]
+async fn client_decrease_initial_window_size_sends_released_capacity() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, vec![b'a'; 16_384])).await;
+
+        // The released 16_384 bytes are below the stream (and connection)
+        // WINDOW_UPDATE threshold, so the next frame is the SETTINGS.
+        srv.recv_frame(frames::settings().initial_window_size(1024))
+            .await;
+        srv.send_frame(frames::settings_ack()).await;
+
+        // After the ACK the stream window is 49_151 - 64_511 = -15_360 while
+        // available is 1_024, so the 16_384 released bytes are now owed.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            srv.recv_frame(frames::window_update(1, 16_384)),
+        )
+        .await
+        .expect("released stream capacity must be advertised after SETTINGS ACK");
+
+        srv.send_frame(frames::data(1, vec![b'a'; 1024]).eos())
+            .await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::handshake(io).await.unwrap();
+
+        let resp = conn
+            .drive(client.get("https://http2.akamai.com/"))
+            .await
+            .expect("response");
+        let mut body = resp.into_body();
+
+        let buf = conn
+            .drive(body.data())
+            .await
+            .expect("data1")
+            .expect("data1");
+        assert_eq!(buf.len(), 16_384);
+        body.flow_control()
+            .release_capacity(16_384)
+            .expect("release_capacity");
+        conn.drive(yield_once()).await;
+
+        conn.set_initial_window_size(1024).expect("update");
+        conn.drive(yield_once()).await;
+
+        let buf = conn
+            .drive(body.data())
+            .await
+            .expect("data2")
+            .expect("data2");
+        assert_eq!(buf.len(), 1024);
+        assert!(body.is_end_stream());
+
+        conn.await.expect("client");
+    };
+
+    join(srv, client).await;
+}
 #[tokio::test]
 async fn server_target_window_size() {
     h2_support::trace_init!();

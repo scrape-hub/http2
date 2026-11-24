@@ -45,6 +45,9 @@ where
     /// Pending GOAWAY frames to write.
     go_away: GoAway,
 
+    /// A refused stream to reset before receiving another frame.
+    pending_refusal: Option<StreamId>,
+
     /// Ping/pong handler
     ping_pong: PingPong,
 
@@ -95,6 +98,31 @@ pub(crate) struct Config {
     pub stream_window_update: Option<WindowUpdatePolicy>,
     pub connection_window_update: Option<WindowUpdatePolicy>,
     pub go_away_on_close: bool,
+    pub data_frame_budget: DataFrameBudget,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DataFrameBudget {
+    Auto,
+    Configured(usize),
+}
+
+impl DataFrameBudget {
+    pub(crate) fn resolve(self, connection_window: Option<WindowSize>) -> usize {
+        match self {
+            Self::Configured(budget) => budget,
+            Self::Auto => {
+                let window = connection_window.unwrap_or(DEFAULT_INITIAL_WINDOW_SIZE);
+                let budget = window as usize / 2;
+
+                budget.max(DEFAULT_DATA_FRAME_BUDGET)
+            }
+        }
+    }
+
+    pub(crate) fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 #[derive(Debug)]
@@ -142,6 +170,7 @@ where
                 initial_stream_window_update: config.initial_stream_window_update,
                 stream_window_update: config.stream_window_update,
                 connection_window_update: config.connection_window_update,
+                data_frame_budget: config.data_frame_budget,
             }
         }
         let streams = Streams::new(streams_config(&config));
@@ -155,6 +184,7 @@ where
                 state: State::Open,
                 error: None,
                 go_away: GoAway::new(),
+                pending_refusal: None,
                 ping_pong: PingPong::new(),
                 settings: Settings::new(config.settings),
                 streams,
@@ -219,7 +249,15 @@ where
             .inner
             .settings
             .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
-        ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
+        if let Some(id) = self.inner.pending_refusal {
+            // Keep the refusal pending if making room requires socket progress.
+            ready!(self.codec.poll_ready(cx))?;
+            self.inner.streams.count_pending_refusal()?;
+            self.codec
+                .buffer(frame::Reset::new(id, Reason::REFUSED_STREAM).into())
+                .expect("invalid RST_STREAM frame");
+            self.inner.pending_refusal = None;
+        }
 
         Poll::Ready(Ok(()))
     }
@@ -255,6 +293,20 @@ where
             // important.
             (_, theirs) => Err(Error::remote_go_away(debug_data, theirs)),
         }
+    }
+
+    fn remote_go_away_if_idle(&self) -> Option<Error> {
+        let frame = self.inner.error.as_ref()?;
+        if frame.reason() == Reason::NO_ERROR || self.inner.streams.has_streams() {
+            return None;
+        }
+
+        // A later transport error should not hide the peer's shutdown reason
+        // once all streams have finished or been rejected by its GOAWAY.
+        Some(Error::remote_go_away(
+            frame.debug_data().clone(),
+            frame.reason(),
+        ))
     }
 
     /// Closes the connection by transitioning to a GOAWAY state
@@ -315,7 +367,9 @@ where
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`
-                            ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
+                            ready!(self.inner.streams.poll_complete(cx, &mut self.codec)).map_err(
+                                |err| self.remote_go_away_if_idle().unwrap_or_else(|| err.into()),
+                            )?;
 
                             if (self.inner.error.is_some()
                                 || self.inner.go_away.should_close_on_idle())
@@ -329,12 +383,20 @@ where
                         }
                     };
 
+                    if matches!(&result, Err(Error::Io(..))) {
+                        if let Some(err) = self.remote_go_away_if_idle() {
+                            return Poll::Ready(Err(err));
+                        }
+                    }
+
                     self.inner.as_dyn().handle_poll2_result(result)?
                 }
                 State::Closing(reason, initiator) => {
                     tracing::trace!("connection closing after flush");
                     // Flush/shutdown the codec
-                    ready!(self.codec.shutdown(cx))?;
+                    ready!(self.codec.shutdown(cx)).map_err(|err| {
+                        self.remote_go_away_if_idle().unwrap_or_else(|| err.into())
+                    })?;
 
                     // Transition the state to error
                     self.inner.state = State::Closed(reason, initiator);
@@ -388,6 +450,10 @@ where
                         &mut self.codec,
                         &mut self.inner.streams,
                     )?;
+                }
+                ReceivedFrame::Refused(id) => {
+                    debug_assert!(self.inner.pending_refusal.is_none());
+                    self.inner.pending_refusal = Some(id);
                 }
                 ReceivedFrame::Continue => (),
                 ReceivedFrame::Done => {
@@ -551,7 +617,10 @@ where
         match frame {
             Some(Headers(frame)) => {
                 tracing::trace!(?frame, "recv HEADERS");
-                self.streams.recv_headers(frame)?;
+                match self.streams.recv_headers(frame)? {
+                    streams::RecvOutcome::Processed => (),
+                    streams::RecvOutcome::Refused(id) => return Ok(ReceivedFrame::Refused(id)),
+                }
             }
             Some(Data(frame)) => {
                 tracing::trace!(?frame, "recv DATA");
@@ -563,7 +632,10 @@ where
             }
             Some(PushPromise(frame)) => {
                 tracing::trace!(?frame, "recv PUSH_PROMISE");
-                self.streams.recv_push_promise(frame)?;
+                match self.streams.recv_push_promise(frame)? {
+                    streams::RecvOutcome::Processed => (),
+                    streams::RecvOutcome::Refused(id) => return Ok(ReceivedFrame::Refused(id)),
+                }
             }
             Some(Settings(frame)) => {
                 tracing::trace!(?frame, "recv SETTINGS");
@@ -610,6 +682,7 @@ where
 }
 
 enum ReceivedFrame {
+    Refused(StreamId),
     Settings(frame::Settings),
     Continue,
     Done,
@@ -668,5 +741,43 @@ where
     fn drop(&mut self) {
         // Ignore errors as this indicates that the mutex is poisoned.
         let _ = self.inner.streams.recv_eof(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_data_frame_budget_scales_with_connection_window() {
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(None),
+            DEFAULT_INITIAL_WINDOW_SIZE as usize / 2
+        );
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(Some(DEFAULT_INITIAL_WINDOW_SIZE)),
+            DEFAULT_INITIAL_WINDOW_SIZE as usize / 2
+        );
+        assert_eq!(DataFrameBudget::Auto.resolve(Some(1024 * 1024)), 512 * 1024);
+    }
+
+    #[test]
+    fn auto_data_frame_budget_has_minimum() {
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(Some(1)),
+            DEFAULT_DATA_FRAME_BUDGET
+        );
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(Some(MAX_WINDOW_SIZE)),
+            MAX_WINDOW_SIZE as usize / 2
+        );
+    }
+
+    #[test]
+    fn configured_data_frame_budget_is_unchanged() {
+        assert_eq!(
+            DataFrameBudget::Configured(123).resolve(Some(MAX_WINDOW_SIZE)),
+            123
+        );
     }
 }

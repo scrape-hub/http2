@@ -3,6 +3,7 @@
 Changes of this fork on top of http2 0.5.12. They let a client send the HTTP/2
 frames of Chrome, Firefox, Safari and OkHttp.
 
+* The fork builds on http2 0.5.20 and h2 up to 4beb484 (2026-11-17).
 * Client `Builder` options: `header_compression` (the HPACK encoders of Chrome,
   Firefox and Safari, see `HeaderCompression`), `stream_dependency_chain`
   (Chromium's exclusive stream dependencies), `initial_stream_window_size`,
@@ -22,6 +23,44 @@ frames of Chrome, Firefox, Safari and OkHttp.
 * A connection holds no read or write buffer while it waits: the write buffer
   (16 KB) is released once flushed and the read buffer (8 KB) while no data is
   pending, and both are allocated again when needed, as Chrome's sockets do.
+
+# 0.4.20 (October 6, 2026)
+
+* Fix counting reserved push promises against stream concurrency limits.
+* Fix automatic small DATA frame budget to update when the connection window changes at runtime.
+* Fix rejecting duplicate `content-length` headers with different values.
+* Fix counting refused streams towards the local reset limit.
+* Fix client to reject responses without a `:status` pseudo header.
+* Fix rare race condition during shutdown.
+* Fix rejecting GOAWAY frames with a non-zero stream identifier.
+* Optimize HPACK Huffman encoding and decoding.
+* Reduce size of HPACK Huffman encoding tables.
+* Optimize receive performance by reducing send buffer locking.
+
+# 0.4.19 (August 24, 2026)
+
+* Improve default (auto) small DATA frame budget based on configured connection window.
+
+# 0.4.18 (August 20, 2026)
+
+* Add `data_frame_budget(n)` methods to client and server builders.
+
+# 0.4.17 (August 19, 2026)
+
+* Fix limiting of excessive small DATA frames to ignore EOS frames.
+* Fix HPACK encoding table to cap the max size to 4kb.
+
+# 0.4.16 (August 17, 2026)
+
+* Fix limiting excessive amount of small DATA frames.
+* Fix double counting pushed streams when receiving 1xx responses.
+* Fix releasing of flow control capacity earlier, when `RecvStream` is dropped.
+* Fix missed wakeup in `poll_trailers`.
+* Fix extra memory retained when copying `HeaderValues`.
+* Fix resets received after END_OF_STREAM to allow the data to still be received.
+* Fix busy-looping when IO write returns 0 to mean connection closed.
+* Optimize HPACK decoding tables from 4-bit states to 1-byte states.
+* Optimize IO writing contention by not holding lock while flushing.
 
 # 0.4.15 (June 15, 2026)
 

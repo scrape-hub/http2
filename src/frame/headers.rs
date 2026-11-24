@@ -7,7 +7,7 @@ use crate::tracing;
 use http::header::{self, HeaderName, HeaderValue};
 use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use smallvec::SmallVec;
 
 use std::fmt;
@@ -217,7 +217,7 @@ struct HeaderBlock {
 
 #[derive(Debug)]
 struct EncodingHeaderBlock {
-    hpack: Bytes,
+    hpack: BytesMut,
 }
 
 const END_STREAM: u8 = 0x1;
@@ -264,7 +264,7 @@ impl Headers {
     /// Loads the header frame but doesn't actually do HPACK decoding.
     ///
     /// HPACK decoding is done in the `load_hpack` step.
-    pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+    pub fn load(head: Head, mut src: BytesMut, capacity: usize) -> Result<(Self, BytesMut), Error> {
         let flags = HeadersFlag(head.flag());
         let mut pad = 0;
 
@@ -317,7 +317,7 @@ impl Headers {
             stream_id: head.stream_id(),
             stream_dep,
             header_block: HeaderBlock {
-                fields: HeaderMap::new(),
+                fields: HeaderMap::with_capacity(capacity),
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -406,7 +406,7 @@ impl Headers {
 
         self.header_block
             .into_encoding(encoder)
-            .encode(head, dst, |dst| {
+            .encode(&head, dst, Some(encoder), |dst| {
                 if let Some(ref stream_dep) = self.stream_dep {
                     // write 5 bytes for the stream dependency
                     stream_dep.encode(dst);
@@ -505,7 +505,7 @@ impl PushPromise {
 
         // A promised request "that indicates the presence of a request body
         // MUST reset the promised stream with a stream error"
-        if let Some(content_length) = req.headers().get(header::CONTENT_LENGTH) {
+        for content_length in req.headers().get_all(header::CONTENT_LENGTH) {
             let parsed_length = parse_u64(content_length.as_bytes());
             if parsed_length != Ok(0) {
                 return Err(InvalidContentLength(parsed_length));
@@ -538,7 +538,7 @@ impl PushPromise {
     /// Loads the push promise frame but doesn't actually do HPACK decoding.
     ///
     /// HPACK decoding is done in the `load_hpack` step.
-    pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+    pub fn load(head: Head, mut src: BytesMut, capacity: usize) -> Result<(Self, BytesMut), Error> {
         let flags = PushPromiseFlag(head.flag());
         let mut pad = 0;
 
@@ -579,7 +579,7 @@ impl PushPromise {
         let frame = PushPromise {
             flags,
             header_block: HeaderBlock {
-                fields: HeaderMap::new(),
+                fields: HeaderMap::with_capacity(capacity),
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -632,7 +632,7 @@ impl PushPromise {
 
         self.header_block
             .into_encoding(encoder)
-            .encode(head, dst, |dst| {
+            .encode(&head, dst, Some(encoder), |dst| {
                 dst.put_u32(promised_id.into());
             })
     }
@@ -675,7 +675,7 @@ impl Continuation {
         // Get the CONTINUATION frame head
         let head = self.head();
 
-        self.header_block.encode(head, dst, |_| {})
+        self.header_block.encode(&head, dst, None, |_| {})
     }
 }
 
@@ -777,7 +777,13 @@ impl Pseudo {
 // ===== impl EncodingHeaderBlock =====
 
 impl EncodingHeaderBlock {
-    fn encode<F>(mut self, head: Head, dst: &mut EncodeBuf<'_>, f: F) -> Option<Continuation>
+    fn encode<F>(
+        mut self,
+        head: &Head,
+        dst: &mut EncodeBuf<'_>,
+        encoder: Option<&mut hpack::Encoder>,
+        f: F,
+    ) -> Option<Continuation>
     where
         F: FnOnce(&mut EncodeBuf<'_>),
     {
@@ -794,7 +800,8 @@ impl EncodingHeaderBlock {
 
         // Now, encode the header payload
         let continuation = if self.hpack.len() > dst.remaining_mut() {
-            dst.put((&mut self.hpack).take(dst.remaining_mut()));
+            let head_part = self.hpack.split_to(dst.remaining_mut());
+            dst.put_slice(&head_part);
 
             Some(Continuation {
                 stream_id: head.stream_id(),
@@ -802,6 +809,11 @@ impl EncodingHeaderBlock {
             })
         } else {
             dst.put_slice(&self.hpack);
+            // The block is fully written, so the buffer can be reused by the
+            // next frame on this connection.
+            if let Some(encoder) = encoder {
+                encoder.return_scratch(self.hpack);
+            }
 
             None
         };
@@ -1077,7 +1089,7 @@ impl HeaderBlock {
                         }
                         if !self.is_over_size {
                             self.field_size += header_size;
-                            if let Err(_) = self.fields.try_append(name, value) {
+                            if self.fields.try_append(name, value).is_err() {
                                 // HeaderMap capacity exceeded — treat as over-size
                                 // so the stream is rejected downstream (RST_STREAM / 431)
                                 // instead of panicking on the 24,577th unique header.
@@ -1119,8 +1131,8 @@ impl HeaderBlock {
     }
 
     fn into_encoding(self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
-        let mut hpack = BytesMut::new();
-
+        let mut hpack = encoder.take_scratch();
+        hpack.clear();
         let headers = Iter {
             pseudo: Some(self.pseudo),
             fields: self.fields.into_iter(),
@@ -1128,9 +1140,7 @@ impl HeaderBlock {
 
         encoder.encode(headers, &mut hpack);
 
-        EncodingHeaderBlock {
-            hpack: hpack.freeze(),
-        }
+        EncodingHeaderBlock { hpack }
     }
 
     /// Calculates the size of the currently decoded header list.
@@ -1418,7 +1428,7 @@ mod test {
         // Parse the HEADERS frame
         let head = Head::parse(&frame[..9]);
         let payload = BytesMut::from(&frame[9..]);
-        let (mut headers, mut hpack_data) = Headers::load(head, payload).unwrap();
+        let (mut headers, mut hpack_data) = Headers::load(head, payload, 0).unwrap();
         // hpack_data contains the HPACK payload (no padding/priority in our frame)
 
         // Decode the HPACK block — this should NOT panic

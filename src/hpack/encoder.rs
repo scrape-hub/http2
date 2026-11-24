@@ -6,12 +6,22 @@ use crate::tracing;
 use bytes::{BufMut, BytesMut};
 use http::header::{HeaderName, HeaderValue};
 
+const DEFAULT_MAX_ALLOWED_SIZE: usize = 4 * 1024;
+
 #[derive(Debug)]
 pub struct Encoder {
     table: Table,
+    max_allowed_size: usize,
     size_update: Option<SizeUpdate>,
     /// Replaces this encoder with a browser's rules.
     browser: Option<BrowserEncoder>,
+    /// Reusable buffer for the encoded header block of a single frame.
+    ///
+    /// A header block only has to live until it is copied into the
+    /// connection write buffer, so the buffer that holds it can be reused
+    /// across frames instead of being allocated and freed per frame. See
+    /// `take_scratch` / `return_scratch`.
+    scratch: BytesMut,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -22,16 +32,44 @@ enum SizeUpdate {
 
 impl Encoder {
     pub fn new(max_size: usize, capacity: usize) -> Encoder {
+        let max_size = max_size.min(DEFAULT_MAX_ALLOWED_SIZE);
+
         Encoder {
             table: Table::new(max_size, capacity),
+            max_allowed_size: DEFAULT_MAX_ALLOWED_SIZE,
             size_update: None,
             browser: None,
+            scratch: BytesMut::new(),
         }
     }
 
     /// Compress header blocks like the given client from now on.
     pub fn set_compression(&mut self, compression: HeaderCompression) {
         self.browser = BrowserEncoder::new(compression, self.table.max_size());
+    }
+
+    #[cfg(test)]
+    fn set_max_allowed_size(&mut self, max: usize) {
+        self.max_allowed_size = max;
+
+        if self.table.max_size() > max {
+            self.update_max_size(max);
+        }
+    }
+
+    /// Takes the reusable buffer for one header-block encode.
+    ///
+    /// The buffer is returned by `return_scratch` once the encoded block has
+    /// been copied into the write buffer. If it is not returned - the
+    /// CONTINUATION path keeps it, since the remainder is still needed - the
+    /// next call simply starts from a fresh buffer.
+    pub(crate) fn take_scratch(&mut self) -> BytesMut {
+        std::mem::take(&mut self.scratch)
+    }
+
+    /// Returns a fully-written header block buffer for reuse.
+    pub(crate) fn return_scratch(&mut self, scratch: BytesMut) {
+        self.scratch = scratch;
     }
 
     /// Queues a max size update.
@@ -42,6 +80,8 @@ impl Encoder {
             browser.update_max_size(val);
             return;
         }
+        let val = val.min(self.max_allowed_size);
+
         match self.size_update {
             Some(SizeUpdate::One(old)) => {
                 if val > old {
@@ -517,6 +557,29 @@ mod test {
     }
 
     #[test]
+    fn test_sensitive_exact_dynamic_match_is_never_indexed() {
+        let mut encoder = Encoder::default();
+        let public = || header("my-password", "same-value");
+        let inserted = encode(&mut encoder, vec![public()]);
+        assert_eq!(inserted[0], 0b0100_0000);
+        assert_eq!(encoder.table.len(), 1);
+
+        let mut value = http::HeaderValue::from_static("same-value");
+        value.set_sensitive(true);
+        let sensitive = Header::Field {
+            name: Some("my-password".parse().unwrap()),
+            value,
+        };
+        let res = encode(&mut encoder, vec![sensitive]);
+        assert!(
+            res.starts_with(&[0b0001_1111, 47]),
+            "sensitive dynamic match must be a never-indexed literal: {res:?}"
+        );
+        assert_eq!(&encode(&mut encoder, vec![public()])[..], &[0xbe]);
+        assert_eq!(encoder.table.len(), 1);
+    }
+
+    #[test]
     fn test_content_length_value_not_indexed() {
         let mut encoder = Encoder::default();
         let res = encode(&mut encoder, vec![header("content-length", "1234")]);
@@ -609,6 +672,7 @@ mod test {
         assert_eq!(Some(SizeUpdate::Two(0, 100)), encoder.size_update);
 
         let mut encoder = Encoder::default();
+        encoder.set_max_allowed_size(8000);
         encoder.update_max_size(8000);
         assert_eq!(Some(SizeUpdate::One(8000)), encoder.size_update);
 
@@ -696,6 +760,7 @@ mod test {
     #[test]
     fn test_large_size_update() {
         let mut encoder = Encoder::default();
+        encoder.set_max_allowed_size(usize::MAX);
 
         encoder.update_max_size(1912930560);
         assert_eq!(Some(SizeUpdate::One(1912930560)), encoder.size_update);
@@ -703,6 +768,22 @@ mod test {
         let mut dst = BytesMut::with_capacity(6);
         encoder.encode_size_updates(&mut dst);
         assert_eq!([63, 225, 129, 148, 144, 7], &dst[..]);
+    }
+
+    #[test]
+    fn test_large_size_update_is_capped() {
+        let mut encoder = Encoder::new(0, 0);
+
+        encoder.update_max_size(1912930560);
+        assert_eq!(
+            Some(SizeUpdate::One(DEFAULT_MAX_ALLOWED_SIZE)),
+            encoder.size_update
+        );
+
+        let mut dst = BytesMut::with_capacity(3);
+        encoder.encode_size_updates(&mut dst);
+        assert_eq!([63, 225, 31], &dst[..]);
+        assert_eq!(DEFAULT_MAX_ALLOWED_SIZE, encoder.table.max_size());
     }
 
     #[test]
