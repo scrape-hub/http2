@@ -360,7 +360,8 @@ impl<B: Buf> SendStream<B> {
     /// RST_STREAM frame with `reason` follows that data, where
     /// [`send_reset`](Self::send_reset) drops it. Safari resets its WebSocket
     /// streams so right after the Close frame that completes the closing
-    /// handshake.
+    /// handshake. Only `Reason::NO_ERROR` keeps the queued data; any other
+    /// reason drops it, like `send_reset`.
     pub fn send_reset_after_data(&mut self, reason: Reason) {
         self.inner.send_reset_after_data(reason)
     }
